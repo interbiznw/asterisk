@@ -35,12 +35,14 @@
 static void rewrite_uri(pjsip_rx_data *rdata, pjsip_sip_uri *uri)
 {
 	pj_cstr(&uri->host, rdata->pkt_info.src_name);
-	if (strcasecmp("udp", rdata->tp_info.transport->type_name)) {
+	uri->port = rdata->pkt_info.src_port;
+	if (!strcasecmp("WSS", rdata->tp_info.transport->type_name)) {
+		/* WSS is special, we don't want to overwrite the URI at all as it needs to be ws */
+	} else if (strcasecmp("udp", rdata->tp_info.transport->type_name)) {
 		uri->transport_param = pj_str(rdata->tp_info.transport->type_name);
 	} else {
 		uri->transport_param.slen = 0;
 	}
-	uri->port = rdata->pkt_info.src_port;
 }
 
 static int rewrite_route_set(pjsip_rx_data *rdata, pjsip_dialog *dlg)
@@ -163,7 +165,7 @@ static int find_transport_state_in_use(void *obj, void *arg, int flags)
 		((details->type == transport_state->type) && (transport_state->factory) &&
 			!pj_strcmp(&transport_state->factory->addr_name.host, &details->local_address) &&
 			transport_state->factory->addr_name.port == details->local_port))) {
-		return CMP_MATCH | CMP_STOP;
+		return CMP_MATCH;
 	}
 
 	return 0;
@@ -260,32 +262,33 @@ static pj_status_t nat_on_tx_message(pjsip_tx_data *tdata)
 		return PJ_SUCCESS;
 	}
 
-	if ( !transport_state->localnet || 	ast_sockaddr_isnull(&transport_state->external_address)) {
-		return PJ_SUCCESS;
-	}
+	if (transport_state->localnet) {
+		ast_sockaddr_parse(&addr, tdata->tp_info.dst_name, PARSE_PORT_FORBID);
+		ast_sockaddr_set_port(&addr, tdata->tp_info.dst_port);
 
-	ast_sockaddr_parse(&addr, tdata->tp_info.dst_name, PARSE_PORT_FORBID);
-	ast_sockaddr_set_port(&addr, tdata->tp_info.dst_port);
-
-	/* See if where we are sending this request is local or not, and if not that we can get a Contact URI to modify */
-	if (ast_apply_ha(transport_state->localnet, &addr) != AST_SENSE_ALLOW) {
-		return PJ_SUCCESS;
-	}
-
-	/* Update the contact header with the external address */
-	if (uri || (uri = nat_get_contact_sip_uri(tdata))) {
-		pj_strdup2(tdata->pool, &uri->host, ast_sockaddr_stringify_host(&transport_state->external_address));
-		if (transport->external_signaling_port) {
-			uri->port = transport->external_signaling_port;
-			ast_debug(4, "Re-wrote Contact URI port to %d\n", uri->port);
+		/* See if where we are sending this request is local or not, and if not that we can get a Contact URI to modify */
+		if (ast_sip_transport_is_local(transport_state, &addr)) {
+			ast_debug(5, "Request is being sent to local address, skipping NAT manipulation\n");
+			return PJ_SUCCESS;
 		}
 	}
 
-	/* Update the via header if relevant */
-	if ((tdata->msg->type == PJSIP_REQUEST_MSG) && (via || (via = pjsip_msg_find_hdr(tdata->msg, PJSIP_H_VIA, NULL)))) {
-		pj_strdup2(tdata->pool, &via->sent_by.host, ast_sockaddr_stringify_host(&transport_state->external_address));
-		if (transport->external_signaling_port) {
-			via->sent_by.port = transport->external_signaling_port;
+	if (!ast_sockaddr_isnull(&transport_state->external_signaling_address)) {
+		/* Update the contact header with the external address */
+		if (uri || (uri = nat_get_contact_sip_uri(tdata))) {
+			pj_strdup2(tdata->pool, &uri->host, ast_sockaddr_stringify_host(&transport_state->external_signaling_address));
+			if (transport->external_signaling_port) {
+				uri->port = transport->external_signaling_port;
+				ast_debug(4, "Re-wrote Contact URI port to %d\n", uri->port);
+			}
+		}
+
+		/* Update the via header if relevant */
+		if ((tdata->msg->type == PJSIP_REQUEST_MSG) && (via || (via = pjsip_msg_find_hdr(tdata->msg, PJSIP_H_VIA, NULL)))) {
+			pj_strdup2(tdata->pool, &via->sent_by.host, ast_sockaddr_stringify_host(&transport_state->external_signaling_address));
+			if (transport->external_signaling_port) {
+				via->sent_by.port = transport->external_signaling_port;
+			}
 		}
 	}
 
@@ -354,18 +357,12 @@ static int unload_module(void)
 
 static int load_module(void)
 {
-	CHECK_PJSIP_SESSION_MODULE_LOADED();
-
 	if (ast_sip_register_service(&nat_module)) {
 		ast_log(LOG_ERROR, "Could not register NAT module for incoming and outgoing requests\n");
-		return AST_MODULE_LOAD_FAILURE;
+		return AST_MODULE_LOAD_DECLINE;
 	}
 
-	if (ast_sip_session_register_supplement(&nat_supplement)) {
-		ast_log(LOG_ERROR, "Could not register NAT session supplement for incoming and outgoing INVITE requests\n");
-		unload_module();
-		return AST_MODULE_LOAD_FAILURE;
-	}
+	ast_sip_session_register_supplement(&nat_supplement);
 
 	return AST_MODULE_LOAD_SUCCESS;
 }
@@ -375,4 +372,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "PJSIP NAT Support",
 	.load = load_module,
 	.unload = unload_module,
 	.load_pri = AST_MODPRI_APP_DEPEND,
+	.requires = "res_pjsip,res_pjsip_session",
 );

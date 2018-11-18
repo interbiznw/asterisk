@@ -29,8 +29,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/bridge.h"
 #include "asterisk/bridge_after.h"
 #include "asterisk/bridge_internal.h"
@@ -157,13 +155,13 @@ static int bridge_stasis_push_peek(struct ast_bridge *self, struct ast_bridge_ch
 	}
 	to_be_replaced = ast_channel_snapshot_get_latest(ast_channel_uniqueid(swap->chan));
 
-	ast_debug(3, "Copying stasis app name %s from %s to %s\n", app_name(control_app(swap_control)),
+	ast_debug(3, "Copying stasis app name %s from %s to %s\n", stasis_app_name(control_app(swap_control)),
 		ast_channel_name(swap->chan), ast_channel_name(bridge_channel->chan));
 
 	ast_channel_lock(bridge_channel->chan);
 
 	/* copy the app name from the swap channel */
-	app_set_replace_channel_app(bridge_channel->chan, app_name(control_app(swap_control)));
+	app_set_replace_channel_app(bridge_channel->chan, stasis_app_name(control_app(swap_control)));
 
 	/* set the replace channel snapshot */
 	app_set_replace_channel_snapshot(bridge_channel->chan, to_be_replaced);
@@ -217,6 +215,7 @@ static int bridge_stasis_push(struct ast_bridge *self, struct ast_bridge_channel
 		 */
 		return -1;
 	}
+	ao2_cleanup(control);
 
 	/*
 	 * If going into a holding bridge, default the role to participant, if
@@ -236,7 +235,6 @@ static int bridge_stasis_push(struct ast_bridge *self, struct ast_bridge_channel
 		}
 	}
 
-	ao2_cleanup(control);
 	if (self->allowed_capabilities & STASIS_BRIDGE_MIXING_CAPABILITIES) {
 		ast_bridge_channel_update_linkedids(bridge_channel, swap);
 		if (ast_test_flag(&self->feature_flags, AST_BRIDGE_FLAG_SMART)) {
@@ -252,7 +250,7 @@ static int bridge_stasis_moving(struct ast_bridge_channel *bridge_channel, void 
 {
 	if (src->v_table == &bridge_stasis_v_table &&
 			dst->v_table != &bridge_stasis_v_table) {
-		RAII_VAR(struct stasis_app_control *, control, NULL, ao2_cleanup);
+		struct stasis_app_control *control;
 		struct ast_channel *chan;
 
 		chan = bridge_channel->chan;
@@ -265,6 +263,7 @@ static int bridge_stasis_moving(struct ast_bridge_channel *bridge_channel, void 
 
 		stasis_app_channel_set_stasis_end_published(chan);
 		app_send_end_msg(control_app(control), chan);
+		ao2_ref(control, -1);
 	}
 
 	return -1;

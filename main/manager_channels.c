@@ -28,8 +28,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/callerid.h"
 #include "asterisk/channel.h"
 #include "asterisk/manager.h"
@@ -138,6 +136,17 @@ ASTERISK_REGISTER_FILE()
 			</syntax>
 			<see-also>
 				<ref type="function">CALLERID</ref>
+			</see-also>
+		</managerEventInstance>
+	</managerEvent>
+	<managerEvent language="en_US" name="NewConnectedLine">
+		<managerEventInstance class="EVENT_FLAG_CALL">
+			<synopsis>Raised when a channel's connected line information is changed.</synopsis>
+			<syntax>
+				<channel_snapshot/>
+			</syntax>
+			<see-also>
+				<ref type="function">CONNECTEDLINE</ref>
 			</see-also>
 		</managerEventInstance>
 	</managerEvent>
@@ -479,16 +488,17 @@ struct ast_str *ast_manager_build_channel_state_string_prefix(
 		const struct ast_channel_snapshot *snapshot,
 		const char *prefix)
 {
-	struct ast_str *out = ast_str_create(1024);
-	int res = 0;
-	char *caller_name, *connected_name;
+	struct ast_str *out;
+	char *caller_name;
+	char *connected_name;
+	int res;
 
-	if (!out) {
+	if (snapshot->tech_properties & AST_CHAN_TP_INTERNAL) {
 		return NULL;
 	}
 
-	if (snapshot->tech_properties & AST_CHAN_TP_INTERNAL) {
-		ast_free(out);
+	out = ast_str_create(1024);
+	if (!out) {
 		return NULL;
 	}
 
@@ -525,10 +535,11 @@ struct ast_str *ast_manager_build_channel_state_string_prefix(
 		prefix, snapshot->uniqueid,
 		prefix, snapshot->linkedid);
 
+	ast_free(caller_name);
+	ast_free(connected_name);
+
 	if (!res) {
 		ast_free(out);
-		ast_free(caller_name);
-		ast_free(connected_name);
 		return NULL;
 	}
 
@@ -543,9 +554,6 @@ struct ast_str *ast_manager_build_channel_state_string_prefix(
 			ast_free(val);
 		}
 	}
-
-	ast_free(caller_name);
-	ast_free(connected_name);
 
 	return out;
 }
@@ -630,7 +638,7 @@ static struct ast_manager_event_blob *channel_newexten(
 
 	/* DEPRECATED: Extension field deprecated in 12; remove in 14 */
 	return ast_manager_event_blob_create(
-		EVENT_FLAG_CALL, "Newexten",
+		EVENT_FLAG_DIALPLAN, "Newexten",
 		"Extension: %s\r\n"
 		"Application: %s\r\n"
 		"AppData: %s\r\n",
@@ -1323,4 +1331,3 @@ int manager_channels_init(void)
 
 	return 0;
 }
-

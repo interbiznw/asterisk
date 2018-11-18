@@ -21,4 +21,25 @@
 === UPGRADE-12.txt  -- Upgrade info for 11 to 12
 === UPGRADE-13.txt  -- Upgrade info for 12 to 13
 === UPGRADE-14.txt  -- Upgrade info for 13 to 14
+=== UPGRADE-15.txt  -- Upgrade info for 14 to 15
+=== UPGRADE-16.txt  -- Upgrade info for 15 to 16
 ===========================================================
+
+New in 17.0.0:
+
+chan_sip:
+ - The chan_sip module is now deprecated, users should migrate to the
+   replacement module chan_pjsip.  See guides at the Asterisk Wiki:
+     https://wiki.asterisk.org/wiki/x/tAHOAQ
+     https://wiki.asterisk.org/wiki/x/hYCLAQ
+
+func_callerid:
+ - The CALLERPRES() dialplan function, deprecated in Asterisk 1.8, has been
+   removed.
+
+res_parking:
+ - The PARKINGSLOT channel variable, deprecated in Asterisk 12 in favor of the
+   PARKING_SPACE channel variable, will no longer be set.
+
+res_xmpp:
+ - The JabberStatus application, deprecated in Asterisk 12, has been removed.

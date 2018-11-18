@@ -33,7 +33,7 @@
  * \addtogroup configuration_file Configuration Files
  */
 
-/*! 
+/*!
  * \page phoneprov.conf phoneprov.conf
  * \verbinclude phoneprov.conf.sample
  */
@@ -52,7 +52,6 @@
 #ifdef SOLARIS
 #include <sys/sockio.h>
 #endif
-ASTERISK_REGISTER_FILE()
 
 #include "asterisk/channel.h"
 #include "asterisk/file.h"
@@ -950,7 +949,7 @@ static int phoneprov_callback(struct ast_tcptls_session_instance *ser, const str
 			socklen_t namelen = sizeof(name.sa);
 			int res;
 
-			if ((res = getsockname(ser->fd, &name.sa, &namelen))) {
+			if ((res = getsockname(ast_iostream_get_fd(ser->stream), &name.sa, &namelen))) {
 				ast_log(LOG_WARNING, "Could not get server IP, breakage likely.\n");
 			} else {
 				struct extension *exten_iter;
@@ -1499,6 +1498,7 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_
 	.unload = unload_module,
 	.reload = reload,
 	.load_pri = AST_MODPRI_CHANNEL_DEPEND,
+	.requires = "http",
 );
 
 /****  Public API for register/unregister, set defaults, and add extension. ****/

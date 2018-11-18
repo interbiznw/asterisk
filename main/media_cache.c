@@ -30,13 +30,12 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include <sys/stat.h>
 #include "asterisk/config.h"
 #include "asterisk/bucket.h"
 #include "asterisk/astdb.h"
 #include "asterisk/cli.h"
+#include "asterisk/file.h"
 #include "asterisk/media_cache.h"
 
 /*! The name of the AstDB family holding items in the cache. */
@@ -50,62 +49,6 @@ ASTERISK_REGISTER_FILE()
 
 /*! Our one and only container holding media items */
 static struct ao2_container *media_cache;
-
-/*!
- * \internal
- * \brief Hashing function for file metadata
- */
-static int media_cache_hash(const void *obj, const int flags)
-{
-	const struct ast_bucket_file *object;
-	const char *key;
-
-	switch (flags & OBJ_SEARCH_MASK) {
-	case OBJ_SEARCH_KEY:
-		key = obj;
-		break;
-	case OBJ_SEARCH_OBJECT:
-		object = obj;
-		key = ast_sorcery_object_get_id(object);
-		break;
-	default:
-		/* Hash can only work on something with a full key */
-		ast_assert(0);
-		return 0;
-	}
-	return ast_str_hash(key);
-}
-
-/*!
- * \internal
- * \brief Comparison function for file metadata
- */
-static int media_cache_cmp(void *obj, void *arg, int flags)
-{
-	struct ast_bucket_file *left = obj;
-	struct ast_bucket_file *right = arg;
-	const char *right_key = arg;
-	int cmp;
-
-	switch (flags & OBJ_SEARCH_MASK) {
-	case OBJ_SEARCH_OBJECT:
-		right_key = ast_sorcery_object_get_id(right);
-		/* Fall through */
-	case OBJ_SEARCH_KEY:
-		cmp = strcmp(ast_sorcery_object_get_id(left), right_key);
-		break;
-	case OBJ_SEARCH_PARTIAL_KEY:
-		cmp = strncmp(ast_sorcery_object_get_id(left), right_key, strlen(right_key));
-		break;
-	default:
-		ast_assert(0);
-		cmp = 0;
-		break;
-	}
-
-	return cmp ? 0 : CMP_MATCH | CMP_STOP;
-}
-
 
 int ast_media_cache_exists(const char *uri)
 {
@@ -183,6 +126,24 @@ static void media_cache_item_del_from_astdb(struct ast_bucket_file *bucket_file)
 
 /*!
  * \internal
+ * \brief Normalize the value of a Content-Type header
+ *
+ * This will trim off any optional parameters after the type/subtype.
+ */
+static void normalize_content_type_header(char *content_type)
+{
+	char *params = strchr(content_type, ';');
+
+	if (params) {
+		*params-- = 0;
+		while (params > content_type && (*params == ' ' || *params == '\t')) {
+			*params-- = 0;
+		}
+	}
+}
+
+/*!
+ * \internal
  * \brief Update the name of the file backing a \c bucket_file
  * \param preferred_file_name The preferred name of the backing file
  */
@@ -200,8 +161,31 @@ static void bucket_file_update_path(struct ast_bucket_file *bucket_file,
 	} else if (!strchr(bucket_file->path, '.') && (ext = strrchr(ast_sorcery_object_get_id(bucket_file), '.'))) {
 		/* If we don't have a file extension and were provided one in the URI, use it */
 		char new_path[PATH_MAX];
+		char found_ext[PATH_MAX];
 
 		ast_bucket_file_metadata_set(bucket_file, "ext", ext);
+
+		/* Don't pass '.' while checking for supported extension */
+		if (!ast_get_format_for_file_ext(ext + 1)) {
+			/* If the file extension passed in the URI isn't supported check for the
+			 * extension based on the MIME type passed in the Content-Type header before
+			 * giving up.
+			 * If a match is found then retrieve the extension from the supported list
+			 * corresponding to the mime-type and use that to rename the file */
+			struct ast_bucket_metadata *header = ast_bucket_file_metadata_get(bucket_file, "content-type");
+			if (header) {
+				char *mime_type = ast_strdup(header->value);
+				if (mime_type) {
+					normalize_content_type_header(mime_type);
+					if (!ast_strlen_zero(mime_type)) {
+						if (ast_get_extension_for_mime_type(mime_type, found_ext, sizeof(found_ext))) {
+							ext = found_ext;
+						}
+					}
+					ast_free(mime_type);
+				}
+			}
+		}
 
 		snprintf(new_path, sizeof(new_path), "%s%s", bucket_file->path, ext);
 		rename(bucket_file->path, new_path);
@@ -226,7 +210,8 @@ int ast_media_cache_retrieve(const char *uri, const char *preferred_file_name,
 	 */
 	bucket_file = ao2_find(media_cache, uri, OBJ_SEARCH_KEY | OBJ_NOLOCK);
 	if (bucket_file) {
-		if (!ast_bucket_file_is_stale(bucket_file)) {
+		if (!ast_bucket_file_is_stale(bucket_file)
+			&& ast_file_is_readable(bucket_file->path)) {
 			ast_copy_string(file_path, bucket_file->path, len);
 			if ((ext = strrchr(file_path, '.'))) {
 				*ext = '\0';
@@ -702,7 +687,7 @@ static struct ast_cli_entry cli_media_cache[] = {
  */
 static void media_cache_shutdown(void)
 {
-	ao2_ref(media_cache, -1);
+	ao2_cleanup(media_cache);
 	media_cache = NULL;
 
 	ast_cli_unregister_multiple(cli_media_cache, ARRAY_LEN(cli_media_cache));
@@ -710,16 +695,15 @@ static void media_cache_shutdown(void)
 
 int ast_media_cache_init(void)
 {
-	ast_register_atexit(media_cache_shutdown);
+	ast_register_cleanup(media_cache_shutdown);
 
-	media_cache = ao2_container_alloc_options(AO2_ALLOC_OPT_LOCK_MUTEX, AO2_BUCKETS,
-		media_cache_hash, media_cache_cmp);
+	media_cache = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, AO2_BUCKETS,
+		ast_sorcery_object_id_hash, NULL, ast_sorcery_object_id_compare);
 	if (!media_cache) {
 		return -1;
 	}
 
 	if (ast_cli_register_multiple(cli_media_cache, ARRAY_LEN(cli_media_cache))) {
-		ao2_ref(media_cache, -1);
 		return -1;
 	}
 

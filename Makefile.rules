@@ -1,6 +1,6 @@
 #
 # Asterisk -- An open source telephony toolkit.
-# 
+#
 # Makefile rules
 #
 # Copyright (C) 2006-2010, Digium, Inc.
@@ -20,6 +20,9 @@
 # Helpful functions
 # call with $(call function,...)
 tolower = $(shell echo $(1) | tr '[:upper:]' '[:lower:]')
+# Takes a list of MENUSELECT_CFLAG Id and returns CFLAGS to declare
+# the ones which are enabled.
+get_menuselect_cflags=$(patsubst %,-D%,$(filter $1,$(MENUSELECT_CFLAGS)))
 
 .PHONY: dist-clean
 
@@ -55,7 +58,7 @@ ifeq ($(NOISY_BUILD),)
     ECHO_PREFIX=@
     CMD_PREFIX=@
 else
-    ECHO_PREFIX=@\# 
+    ECHO_PREFIX=@\#
     CMD_PREFIX=
 endif
 
@@ -176,29 +179,17 @@ ifeq ($(GNU_LD),1)
 	$(CMD_PREFIX) $(ASTTOPDIR)/build_tools/make_linker_version_script $* "$(LINKER_SYMBOL_PREFIX)" "$(ASTTOPDIR)"
 endif
 	$(ECHO_PREFIX) echo "   [LD] $^ -> $@"
-	$(CMD_PREFIX) $(CC) $(STATIC_BUILD) -o $@ $(CC_LDFLAGS_SO) $^ $(CC_LIBS)
+	$(CMD_PREFIX) $(CC) -o $@ $(CC_LDFLAGS_SO) $^ $(CC_LIBS)
 
 %.so: %.oo
 ifeq ($(GNU_LD),1)
 	$(CMD_PREFIX) $(ASTTOPDIR)/build_tools/make_linker_version_script $* "$(LINKER_SYMBOL_PREFIX)" "$(ASTTOPDIR)"
 endif
 	$(ECHO_PREFIX) echo "   [LDXX] $^ -> $@"
-	$(CMD_PREFIX) $(CXX) $(STATIC_BUILD) -o $@ $(CXX_LDFLAGS_SO) $^ $(CXX_LIBS)
-
-%.eo: %.o
-	$(ECHO_PREFIX) echo "   [EMBED] $< -> $@"
-	$(CMD_PREFIX) $(ASTTOPDIR)/build_tools/make_linker_eo_script $* > .$@.ld
-	$(CMD_PREFIX) $(LD) -r -T .$@.ld -o $@ $<
-	$(CMD_PREFIX) rm -f .$@.ld
-
-%.eo: %.oo
-	$(ECHO_PREFIX) echo "   [EMBED] $< -> $@"
-	$(CMD_PREFIX) $(ASTTOPDIR)/build_tools/make_linker_eo_script $* > .$@.ld
-	$(CMD_PREFIX) $(LD) -r -T .$@.ld -o $@ $<
-	$(CMD_PREFIX) rm -f .$@.ld
+	$(CMD_PREFIX) $(CXX) -o $@ $(CXX_LDFLAGS_SO) $^ $(CXX_LIBS)
 
 %: %.o
 	$(ECHO_PREFIX) echo "   [LD] $^ -> $@"
-	$(CMD_PREFIX) $(CXX) $(STATIC_BUILD) -o $@ $(PTHREAD_CFLAGS) $(_ASTLDFLAGS) $^ $(CXX_LIBS) $(ASTLDFLAGS)
+	$(CMD_PREFIX) $(CXX) -o $@ $(PTHREAD_CFLAGS) $(_ASTLDFLAGS) $^ $(CXX_LIBS) $(ASTLDFLAGS)
 
 dist-clean:: clean

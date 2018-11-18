@@ -41,6 +41,27 @@
 	<configInfo name="res_pjproject" language="en_US">
 		<synopsis>pjproject common configuration</synopsis>
 		<configFile name="pjproject.conf">
+			<configObject name="startup">
+				<synopsis>Asterisk startup time options for PJPROJECT</synopsis>
+				<description>
+					<note><para>The id of this object, as well as its type, must be
+					'startup' or it won't be found.</para></note>
+				</description>
+				<configOption name="type">
+					<synopsis>Must be of type 'startup'.</synopsis>
+				</configOption>
+				<configOption name="log_level" default="2">
+					<synopsis>Initial maximum pjproject logging level to log.</synopsis>
+					<description>
+						<para>Valid values are: 0-6, and default</para>
+					<note><para>
+						This option is needed very early in the startup process
+						so it can only be read from config files because the
+						modules for other methods have not been loaded yet.
+					</para></note>
+					</description>
+				</configOption>
+			</configObject>
 			<configObject name="log_mappings">
 				<synopsis>PJPROJECT to Asterisk Log Level Mapping</synopsis>
 				<description><para>Warnings and errors in the pjproject libraries are generally handled
@@ -64,7 +85,7 @@
 				<configOption name="asterisk_notice" default="">
 					<synopsis>A comma separated list of pjproject log levels to map to Asterisk LOG_NOTICE.</synopsis>
 				</configOption>
-				<configOption name="asterisk_debug" default="3,4,5">
+				<configOption name="asterisk_debug" default="3,4,5,6">
 					<synopsis>A comma separated list of pjproject log levels to map to Asterisk LOG_DEBUG.</synopsis>
 				</configOption>
 				<configOption name="asterisk_verbose" default="">
@@ -77,19 +98,20 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include <stdarg.h>
 #include <pjlib.h>
 #include <pjsip.h>
 #include <pj/log.h>
 
+#include "asterisk/options.h"
 #include "asterisk/logger.h"
 #include "asterisk/module.h"
 #include "asterisk/cli.h"
 #include "asterisk/res_pjproject.h"
 #include "asterisk/vector.h"
 #include "asterisk/sorcery.h"
+#include "asterisk/test.h"
+#include "asterisk/netsock2.h"
 
 static struct ast_sorcery *pjproject_sorcery;
 static pj_log_func *log_cb_orig;
@@ -146,9 +168,11 @@ static struct log_mappings *get_log_mappings(void)
 
 static int get_log_level(int pj_level)
 {
-	RAII_VAR(struct log_mappings *, mappings, get_log_mappings(), ao2_cleanup);
+	int mapped_level;
 	unsigned char l;
+	struct log_mappings *mappings;
 
+	mappings = get_log_mappings();
 	if (!mappings) {
 		return __LOG_ERROR;
 	}
@@ -156,18 +180,21 @@ static int get_log_level(int pj_level)
 	l = '0' + fmin(pj_level, 9);
 
 	if (strchr(mappings->asterisk_error, l)) {
-		return __LOG_ERROR;
+		mapped_level = __LOG_ERROR;
 	} else if (strchr(mappings->asterisk_warning, l)) {
-		return __LOG_WARNING;
+		mapped_level = __LOG_WARNING;
 	} else if (strchr(mappings->asterisk_notice, l)) {
-		return __LOG_NOTICE;
+		mapped_level = __LOG_NOTICE;
 	} else if (strchr(mappings->asterisk_verbose, l)) {
-		return __LOG_VERBOSE;
+		mapped_level = __LOG_VERBOSE;
 	} else if (strchr(mappings->asterisk_debug, l)) {
-		return __LOG_DEBUG;
+		mapped_level = __LOG_DEBUG;
+	} else {
+		mapped_level = __LOG_SUPPRESS;
 	}
 
-	return __LOG_SUPPRESS;
+	ao2_ref(mappings, -1);
+	return mapped_level;
 }
 
 static void log_forwarder(int level, const char *data, int len)
@@ -194,13 +221,6 @@ static void log_forwarder(int level, const char *data, int len)
 		return;
 	}
 
-	if (ast_level == __LOG_DEBUG) {
-		/* Obey the debug level for res_pjproject */
-		if (!DEBUG_ATLEAST(level)) {
-			return;
-		}
-	}
-
 	/* PJPROJECT uses indention to indicate function call depth. We'll prepend
 	 * log statements with a tab so they'll have a better shot at lining
 	 * up */
@@ -209,11 +229,16 @@ static void log_forwarder(int level, const char *data, int len)
 
 static void capture_buildopts_cb(int level, const char *data, int len)
 {
+	char *dup;
+
 	if (strstr(data, "Teluu") || strstr(data, "Dumping")) {
 		return;
 	}
 
-	AST_VECTOR_ADD_SORTED(&buildopts, ast_strdup(ast_skip_blanks(data)), strcmp);
+	dup = ast_strdup(ast_skip_blanks(data));
+	if (dup && AST_VECTOR_ADD_SORTED(&buildopts, dup, strcmp)) {
+		ast_free(dup);
+	}
 }
 
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
@@ -255,16 +280,6 @@ void ast_pjproject_log_intercept_end(void)
 	pjproject_log_intercept.thread = AST_PTHREADT_NULL;
 
 	ast_mutex_unlock(&pjproject_log_intercept_lock);
-}
-
-void ast_pjproject_ref(void)
-{
-	ast_module_ref(ast_module_info->self);
-}
-
-void ast_pjproject_unref(void)
-{
-	ast_module_unref(ast_module_info->self);
 }
 
 static char *handle_pjproject_show_buildopts(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
@@ -351,10 +366,290 @@ static char *handle_pjproject_show_log_mappings(struct ast_cli_entry *e, int cmd
 	return CLI_SUCCESS;
 }
 
+struct max_pjproject_log_level_check {
+	/*!
+	 * Compile time sanity check to determine if
+	 * MAX_PJ_LOG_MAX_LEVEL matches CLI syntax.
+	 */
+	char check[1 / (6 == MAX_PJ_LOG_MAX_LEVEL)];
+};
+
+static char *handle_pjproject_set_log_level(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	int level_new;
+	int level_old;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "pjproject set log level {default|0|1|2|3|4|5|6}";
+		e->usage =
+			"Usage: pjproject set log level {default|<level>}\n"
+			"\n"
+			"       Set the maximum active pjproject logging level.\n"
+			"       See pjproject.conf.sample for additional information\n"
+			"       about the various levels pjproject uses.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc != 5) {
+		return CLI_SHOWUSAGE;
+	}
+
+	if (!strcasecmp(a->argv[4], "default")) {
+		level_new = DEFAULT_PJ_LOG_MAX_LEVEL;
+	} else {
+		if (sscanf(a->argv[4], "%30d", &level_new) != 1
+			|| level_new < 0 || MAX_PJ_LOG_MAX_LEVEL < level_new) {
+			return CLI_SHOWUSAGE;
+		}
+	}
+
+	/* Update pjproject logging level */
+	if (ast_pjproject_max_log_level < level_new) {
+		level_new = ast_pjproject_max_log_level;
+		ast_cli(a->fd,
+			"Asterisk built or linked with pjproject PJ_LOG_MAX_LEVEL=%d.\n"
+			"Lowering request to the max supported level.\n",
+			ast_pjproject_max_log_level);
+	}
+	level_old = ast_option_pjproject_log_level;
+	if (level_old == level_new) {
+		ast_cli(a->fd, "pjproject log level is still %d.\n", level_old);
+	} else {
+		ast_cli(a->fd, "pjproject log level was %d and is now %d.\n",
+			level_old, level_new);
+		ast_option_pjproject_log_level = level_new;
+		pj_log_set_level(level_new);
+	}
+
+	return CLI_SUCCESS;
+}
+
+static char *handle_pjproject_show_log_level(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "pjproject show log level";
+		e->usage =
+			"Usage: pjproject show log level\n"
+			"\n"
+			"       Show the current maximum active pjproject logging level.\n"
+			"       See pjproject.conf.sample for additional information\n"
+			"       about the various levels pjproject uses.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc != 4) {
+		return CLI_SHOWUSAGE;
+	}
+
+	ast_cli(a->fd, "pjproject log level is %d.%s\n",
+		ast_option_pjproject_log_level,
+		ast_option_pjproject_log_level == DEFAULT_PJ_LOG_MAX_LEVEL ? " (default)" : "");
+
+	return CLI_SUCCESS;
+}
+
 static struct ast_cli_entry pjproject_cli[] = {
+	AST_CLI_DEFINE(handle_pjproject_set_log_level, "Set the maximum active pjproject logging level"),
 	AST_CLI_DEFINE(handle_pjproject_show_buildopts, "Show the compiled config of the pjproject in use"),
 	AST_CLI_DEFINE(handle_pjproject_show_log_mappings, "Show pjproject to Asterisk log mappings"),
+	AST_CLI_DEFINE(handle_pjproject_show_log_level, "Show the maximum active pjproject logging level"),
 };
+
+void ast_pjproject_caching_pool_init(pj_caching_pool *cp,
+	const pj_pool_factory_policy *policy, pj_size_t max_capacity)
+{
+	/* Passing a max_capacity of zero disables caching pools */
+	pj_caching_pool_init(cp, policy, ast_option_pjproject_cache_pools ? max_capacity : 0);
+}
+
+void ast_pjproject_caching_pool_destroy(pj_caching_pool *cp)
+{
+	pj_caching_pool_destroy(cp);
+}
+
+int ast_sockaddr_to_pj_sockaddr(const struct ast_sockaddr *addr, pj_sockaddr *pjaddr)
+{
+	if (addr->ss.ss_family == AF_INET) {
+		struct sockaddr_in *sin = (struct sockaddr_in *) &addr->ss;
+		pjaddr->ipv4.sin_family = pj_AF_INET();
+#ifdef HAVE_PJPROJECT_BUNDLED
+		pjaddr->ipv4.sin_addr = sin->sin_addr;
+#else
+		pjaddr->ipv4.sin_addr.s_addr = sin->sin_addr.s_addr;
+#endif
+		pjaddr->ipv4.sin_port   = sin->sin_port;
+	} else if (addr->ss.ss_family == AF_INET6) {
+		struct sockaddr_in6 *sin = (struct sockaddr_in6 *) &addr->ss;
+		pjaddr->ipv6.sin6_family   = pj_AF_INET6();
+		pjaddr->ipv6.sin6_port     = sin->sin6_port;
+		pjaddr->ipv6.sin6_flowinfo = sin->sin6_flowinfo;
+		pjaddr->ipv6.sin6_scope_id = sin->sin6_scope_id;
+		memcpy(&pjaddr->ipv6.sin6_addr, &sin->sin6_addr, sizeof(pjaddr->ipv6.sin6_addr));
+	} else {
+		memset(pjaddr, 0, sizeof(*pjaddr));
+		return -1;
+	}
+	return 0;
+}
+
+int ast_sockaddr_from_pj_sockaddr(struct ast_sockaddr *addr, const pj_sockaddr *pjaddr)
+{
+	if (pjaddr->addr.sa_family == pj_AF_INET()) {
+		struct sockaddr_in *sin = (struct sockaddr_in *) &addr->ss;
+		sin->sin_family = AF_INET;
+#ifdef HAVE_PJPROJECT_BUNDLED
+		sin->sin_addr = pjaddr->ipv4.sin_addr;
+#else
+		sin->sin_addr.s_addr = pjaddr->ipv4.sin_addr.s_addr;
+#endif
+		sin->sin_port   = pjaddr->ipv4.sin_port;
+		addr->len = sizeof(struct sockaddr_in);
+	} else if (pjaddr->addr.sa_family == pj_AF_INET6()) {
+		struct sockaddr_in6 *sin = (struct sockaddr_in6 *) &addr->ss;
+		sin->sin6_family   = AF_INET6;
+		sin->sin6_port     = pjaddr->ipv6.sin6_port;
+		sin->sin6_flowinfo = pjaddr->ipv6.sin6_flowinfo;
+		sin->sin6_scope_id = pjaddr->ipv6.sin6_scope_id;
+		memcpy(&sin->sin6_addr, &pjaddr->ipv6.sin6_addr, sizeof(sin->sin6_addr));
+		addr->len = sizeof(struct sockaddr_in6);
+	} else {
+		memset(addr, 0, sizeof(*addr));
+		return -1;
+	}
+	return 0;
+}
+
+#ifdef TEST_FRAMEWORK
+static void fill_with_garbage(void *x, ssize_t len)
+{
+	unsigned char *w = x;
+	while (len > 0) {
+		int r = ast_random();
+		memcpy(w, &r, len > sizeof(r) ? sizeof(r) : len);
+		w += sizeof(r);
+		len -= sizeof(r);
+	}
+}
+
+AST_TEST_DEFINE(ast_sockaddr_to_pj_sockaddr_test)
+{
+	char *candidates[] = {
+		"127.0.0.1:5555",
+		"[::]:4444",
+		"192.168.0.100:0",
+		"[fec0::1:80]:0",
+		"[fec0::1]:80",
+		NULL,
+	}, **candidate = candidates;
+
+	switch (cmd) {
+	case TEST_INIT:
+		info->name = "ast_sockaddr_to_pj_sockaddr_test";
+		info->category = "/res/res_pjproject/";
+		info->summary = "Validate conversions from an ast_sockaddr to a pj_sockaddr";
+		info->description = "This test converts an ast_sockaddr to a pj_sockaddr and validates\n"
+			"that the two evaluate to the same string when formatted.";
+		return AST_TEST_NOT_RUN;
+	case TEST_EXECUTE:
+		break;
+	}
+
+	while (*candidate) {
+		struct ast_sockaddr addr = {{0,}};
+		pj_sockaddr pjaddr;
+		char buffer[512];
+
+		fill_with_garbage(&pjaddr, sizeof(pj_sockaddr));
+
+		if (!ast_sockaddr_parse(&addr, *candidate, 0)) {
+			ast_test_status_update(test, "Failed to parse candidate IP: %s\n", *candidate);
+			return AST_TEST_FAIL;
+		}
+
+		if (ast_sockaddr_to_pj_sockaddr(&addr, &pjaddr)) {
+			ast_test_status_update(test, "Failed to convert ast_sockaddr to pj_sockaddr: %s\n", *candidate);
+			return AST_TEST_FAIL;
+		}
+
+		pj_sockaddr_print(&pjaddr, buffer, sizeof(buffer), 1 | 2);
+
+		if (strcmp(*candidate, buffer)) {
+			ast_test_status_update(test, "Converted sockaddrs do not match: \"%s\" and \"%s\"\n",
+				*candidate,
+				buffer);
+			return AST_TEST_FAIL;
+		}
+
+		candidate++;
+	}
+
+	return AST_TEST_PASS;
+}
+
+AST_TEST_DEFINE(ast_sockaddr_from_pj_sockaddr_test)
+{
+	char *candidates[] = {
+		"127.0.0.1:5555",
+		"[::]:4444",
+		"192.168.0.100:0",
+		"[fec0::1:80]:0",
+		"[fec0::1]:80",
+		NULL,
+	}, **candidate = candidates;
+
+	switch (cmd) {
+	case TEST_INIT:
+		info->name = "ast_sockaddr_from_pj_sockaddr_test";
+		info->category = "/res/res_pjproject/";
+		info->summary = "Validate conversions from a pj_sockaddr to an ast_sockaddr";
+		info->description = "This test converts a pj_sockaddr to an ast_sockaddr and validates\n"
+			"that the two evaluate to the same string when formatted.";
+		return AST_TEST_NOT_RUN;
+	case TEST_EXECUTE:
+		break;
+	}
+
+	while (*candidate) {
+		struct ast_sockaddr addr = {{0,}};
+		pj_sockaddr pjaddr;
+		pj_str_t t;
+		char buffer[512];
+
+		fill_with_garbage(&addr, sizeof(addr));
+
+		pj_strset(&t, *candidate, strlen(*candidate));
+
+		if (pj_sockaddr_parse(pj_AF_UNSPEC(), 0, &t, &pjaddr) != PJ_SUCCESS) {
+			ast_test_status_update(test, "Failed to parse candidate IP: %s\n", *candidate);
+			return AST_TEST_FAIL;
+		}
+
+		if (ast_sockaddr_from_pj_sockaddr(&addr, &pjaddr)) {
+			ast_test_status_update(test, "Failed to convert pj_sockaddr to ast_sockaddr: %s\n", *candidate);
+			return AST_TEST_FAIL;
+		}
+
+		snprintf(buffer, sizeof(buffer), "%s", ast_sockaddr_stringify(&addr));
+
+		if (strcmp(*candidate, buffer)) {
+			ast_test_status_update(test, "Converted sockaddrs do not match: \"%s\" and \"%s\"\n",
+				*candidate,
+				buffer);
+			return AST_TEST_FAIL;
+		}
+
+		candidate++;
+	}
+
+	return AST_TEST_PASS;
+}
+#endif
 
 static int load_module(void)
 {
@@ -387,10 +682,11 @@ static int load_module(void)
 	}
 	ast_string_field_set(default_log_mappings, asterisk_error, "0,1");
 	ast_string_field_set(default_log_mappings, asterisk_warning, "2");
-	ast_string_field_set(default_log_mappings, asterisk_debug, "3,4,5");
+	ast_string_field_set(default_log_mappings, asterisk_debug, "3,4,5,6");
 
 	ast_sorcery_load(pjproject_sorcery);
 
+	AST_PJPROJECT_INIT_LOG_LEVEL();
 	pj_init();
 
 	decor_orig = pj_log_get_decor();
@@ -405,11 +701,27 @@ static int load_module(void)
 	 */
 	pj_log_set_log_func(capture_buildopts_cb);
 	pj_log_set_decor(0);
+	pj_log_set_level(MAX_PJ_LOG_MAX_LEVEL);/* Set level to guarantee the dump output. */
 	pj_dump_config();
 	pj_log_set_decor(PJ_LOG_HAS_SENDER | PJ_LOG_HAS_INDENT);
 	pj_log_set_log_func(log_forwarder);
+	if (ast_pjproject_max_log_level < ast_option_pjproject_log_level) {
+		ast_log(LOG_WARNING,
+			"Asterisk built or linked with pjproject PJ_LOG_MAX_LEVEL=%d which is too low for startup level: %d.\n",
+			ast_pjproject_max_log_level, ast_option_pjproject_log_level);
+		ast_option_pjproject_log_level = ast_pjproject_max_log_level;
+	}
+	pj_log_set_level(ast_option_pjproject_log_level);
+	if (!AST_VECTOR_SIZE(&buildopts)) {
+		ast_log(LOG_NOTICE,
+			"Asterisk built or linked with pjproject PJ_LOG_MAX_LEVEL=%d which is too low to get buildopts.\n",
+			ast_pjproject_max_log_level);
+	}
 
 	ast_cli_register_multiple(pjproject_cli, ARRAY_LEN(pjproject_cli));
+
+	AST_TEST_REGISTER(ast_sockaddr_to_pj_sockaddr_test);
+	AST_TEST_REGISTER(ast_sockaddr_from_pj_sockaddr_test);
 
 	return AST_MODULE_LOAD_SUCCESS;
 }
@@ -422,7 +734,7 @@ static int unload_module(void)
 	pj_log_set_log_func(log_cb_orig);
 	pj_log_set_decor(decor_orig);
 
-	AST_VECTOR_REMOVE_CMP_UNORDERED(&buildopts, NULL, NOT_EQUALS, ast_free);
+	AST_VECTOR_CALLBACK_VOID(&buildopts, ast_free);
 	AST_VECTOR_FREE(&buildopts);
 
 	ast_debug(3, "Stopped PJPROJECT logging to Asterisk logger\n");
@@ -433,6 +745,9 @@ static int unload_module(void)
 	default_log_mappings = NULL;
 
 	ast_sorcery_unref(pjproject_sorcery);
+
+	AST_TEST_UNREGISTER(ast_sockaddr_to_pj_sockaddr_test);
+	AST_TEST_UNREGISTER(ast_sockaddr_from_pj_sockaddr_test);
 
 	return 0;
 }

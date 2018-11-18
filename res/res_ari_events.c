@@ -35,12 +35,11 @@
 	<depend type="module">res_ari</depend>
 	<depend type="module">res_ari_model</depend>
 	<depend type="module">res_stasis</depend>
+	<depend type="module">res_http_websocket</depend>
 	<support_level>core</support_level>
  ***/
 
 #include "asterisk.h"
-
-ASTERISK_REGISTER_FILE()
 
 #include "asterisk/app.h"
 #include "asterisk/module.h"
@@ -289,11 +288,10 @@ int ast_ari_events_user_event_parse_body(
 static void ast_ari_events_user_event_cb(
 	struct ast_tcptls_session_instance *ser,
 	struct ast_variable *get_params, struct ast_variable *path_vars,
-	struct ast_variable *headers, struct ast_ari_response *response)
+	struct ast_variable *headers, struct ast_json *body, struct ast_ari_response *response)
 {
 	struct ast_ari_events_user_event_args args = {};
 	struct ast_variable *i;
-	RAII_VAR(struct ast_json *, body, NULL, ast_json_unref);
 #if defined(AST_DEVMODE)
 	int is_valid;
 	int code;
@@ -353,21 +351,6 @@ static void ast_ari_events_user_event_cb(
 			args.event_name = (i->value);
 		} else
 		{}
-	}
-	/* Look for a JSON request entity */
-	body = ast_http_get_json(ser, headers);
-	if (!body) {
-		switch (errno) {
-		case EFBIG:
-			ast_ari_response_error(response, 413, "Request Entity Too Large", "Request body too large");
-			goto fin;
-		case ENOMEM:
-			ast_ari_response_error(response, 500, "Internal Server Error", "Error processing request");
-			goto fin;
-		case EIO:
-			ast_ari_response_error(response, 400, "Bad Request", "Error parsing request body");
-			goto fin;
-		}
 	}
 	args.variables = body;
 	ast_ari_events_user_event(headers, &args, response);
@@ -435,47 +418,54 @@ static struct stasis_rest_handlers events = {
 	.children = { &events_user, }
 };
 
-static int load_module(void)
-{
-	int res = 0;
-	struct ast_websocket_protocol *protocol;
-
-	if (ast_ari_websocket_events_event_websocket_init() == -1) {
-		return AST_MODULE_LOAD_FAILURE;
-	}
-
-	events.ws_server = ast_websocket_server_create();
-	if (!events.ws_server) {
-		return AST_MODULE_LOAD_FAILURE;
-	}
-
-	protocol = ast_websocket_sub_protocol_alloc("ari");
-	if (!protocol) {
-		ao2_ref(events.ws_server, -1);
-		events.ws_server = NULL;
-		return AST_MODULE_LOAD_FAILURE;
-	}
-	protocol->session_attempted = ast_ari_events_event_websocket_ws_attempted_cb;
-	protocol->session_established = ast_ari_events_event_websocket_ws_established_cb;
-	res |= ast_websocket_server_add_protocol2(events.ws_server, protocol);
-	stasis_app_ref();
-	res |= ast_ari_add_handler(&events);
-	return res;
-}
-
 static int unload_module(void)
 {
 	ast_ari_remove_handler(&events);
 	ao2_cleanup(events.ws_server);
 	events.ws_server = NULL;
 	ast_ari_websocket_events_event_websocket_dtor();
-	stasis_app_unref();
 	return 0;
+}
+
+static int load_module(void)
+{
+	int res = 0;
+
+	struct ast_websocket_protocol *protocol;
+
+	if (ast_ari_websocket_events_event_websocket_init() == -1) {
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
+	events.ws_server = ast_websocket_server_create();
+	if (!events.ws_server) {
+		ast_ari_websocket_events_event_websocket_dtor();
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
+	protocol = ast_websocket_sub_protocol_alloc("ari");
+	if (!protocol) {
+		ao2_ref(events.ws_server, -1);
+		events.ws_server = NULL;
+		ast_ari_websocket_events_event_websocket_dtor();
+		return AST_MODULE_LOAD_DECLINE;
+	}
+	protocol->session_attempted = ast_ari_events_event_websocket_ws_attempted_cb;
+	protocol->session_established = ast_ari_events_event_websocket_ws_established_cb;
+	res |= ast_websocket_server_add_protocol2(events.ws_server, protocol);
+
+	res |= ast_ari_add_handler(&events);
+	if (res) {
+		unload_module();
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
+	return AST_MODULE_LOAD_SUCCESS;
 }
 
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_DEFAULT, "RESTful API module - WebSocket resource",
 	.support_level = AST_MODULE_SUPPORT_CORE,
 	.load = load_module,
 	.unload = unload_module,
-	.nonoptreq = "res_ari,res_stasis",
+	.requires = "res_ari,res_ari_model,res_stasis,res_http_websocket",
 );

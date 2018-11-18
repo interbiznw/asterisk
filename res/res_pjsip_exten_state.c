@@ -415,8 +415,9 @@ static int new_subscribe(struct ast_sip_endpoint *endpoint,
 	const char *context = S_OR(endpoint->subscription.context, endpoint->context);
 
 	if (!ast_exists_extension(NULL, context, resource, PRIORITY_HINT, NULL)) {
-		ast_log(LOG_NOTICE, "Extension state subscription failed: Extension %s does not exist in context '%s' or has no associated hint\n",
-			resource, context);
+		ast_log(LOG_NOTICE, "Endpoint '%s' state subscription failed: "
+			"Extension '%s' does not exist in context '%s' or has no associated hint\n",
+			ast_sorcery_object_get_id(endpoint), resource, context);
 		return 404;
 	}
 
@@ -728,8 +729,11 @@ static int exten_state_publisher_state_cb(const char *context, const char *exten
 		}
 
 		ao2_ref(publisher, +1);
-		AST_VECTOR_APPEND(&pub_data->pubs, publisher);
-		ast_debug(5, "'%s' will publish exten state\n", publisher->name);
+		if (AST_VECTOR_APPEND(&pub_data->pubs, publisher)) {
+			ao2_ref(publisher, -1);
+		} else {
+			ast_debug(5, "'%s' will publish exten state\n", publisher->name);
+		}
 	}
 	ao2_iterator_destroy(&publisher_iter);
 
@@ -955,13 +959,6 @@ static int unload_module(void)
 
 static int load_module(void)
 {
-	CHECK_PJSIP_PUBSUB_MODULE_LOADED();
-
-	if (!ast_module_check("res_pjsip_outbound_publish.so")) {
-		ast_log(LOG_WARNING, "This module requires the 'res_pjsip_outbound_publish.so' module to be loaded\n");
-		return AST_MODULE_LOAD_DECLINE;
-	}
-
 	publishers = ao2_container_alloc(PUBLISHER_BUCKETS, exten_state_publisher_hash,
 		exten_state_publisher_cmp);
 	if (!publishers) {
@@ -1011,4 +1008,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "PJSIP Extension State
 	.load = load_module,
 	.unload = unload_module,
 	.load_pri = AST_MODPRI_CHANNEL_DEPEND + 5,
+	.requires = "res_pjsip,res_pjsip_pubsub,res_pjsip_outbound_publish",
 );

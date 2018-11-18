@@ -24,19 +24,16 @@
  */
 
 /*** MODULEINFO
-	<depend type="module">res_stasis_recording</depend>
-	<depend type="module">res_stasis_playback</depend>
 	<support_level>core</support_level>
  ***/
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "resource_bridges.h"
 #include "asterisk/stasis.h"
 #include "asterisk/stasis_bridges.h"
 #include "asterisk/stasis_app.h"
+#include "asterisk/stasis_app_impl.h"
 #include "asterisk/stasis_app_playback.h"
 #include "asterisk/stasis_app_recording.h"
 #include "asterisk/stasis_channels.h"
@@ -219,6 +216,12 @@ void ast_ari_bridges_add_channel(struct ast_variable *headers,
 				return;
 			}
 		}
+
+		/* Apply bridge features to each of the channel controls */
+		if (!stasis_app_control_bridge_features_init(list->controls[i])) {
+			stasis_app_control_absorb_dtmf_in_bridge(list->controls[i], args->absorb_dtmf);
+			stasis_app_control_mute_in_bridge(list->controls[i], args->mute);
+		}
 	}
 
 	for (i = 0; i < list->count; ++i) {
@@ -387,7 +390,6 @@ static int ari_bridges_play_helper(const char **args_media,
 
 	if (ast_asprintf(playback_url, "/playbacks/%s",
 			stasis_app_playback_get_id(playback)) == -1) {
-		playback_url = NULL;
 		ast_ari_response_alloc_failed(response);
 		return -1;
 	}
@@ -823,6 +825,7 @@ void ast_ari_bridges_start_moh(struct ast_variable *headers,
 	}
 
 	ast_moh_start(moh_channel, moh_class, NULL);
+	ast_channel_cleanup(moh_channel);
 
 	ast_ari_response_no_content(response);
 
@@ -964,13 +967,12 @@ void ast_ari_bridges_create_with_id(struct ast_variable *headers,
 
 	if (bridge) {
 		/* update */
-		if (!ast_strlen_zero(args->name)) {
-			if (!strcmp(args->name, bridge->name)) {
-				ast_ari_response_error(
-					response, 500, "Internal Error",
-					"Changing bridge name is not implemented");
-				return;
-			}
+		if (!ast_strlen_zero(args->name)
+			&& strcmp(args->name, bridge->name)) {
+			ast_ari_response_error(
+				response, 500, "Internal Error",
+				"Changing bridge name is not implemented");
+			return;
 		}
 		if (!ast_strlen_zero(args->type)) {
 			ast_ari_response_error(
@@ -1004,4 +1006,69 @@ void ast_ari_bridges_create_with_id(struct ast_variable *headers,
 
 	ast_ari_response_ok(response,
 		ast_bridge_snapshot_to_json(snapshot, stasis_app_get_sanitizer()));
+}
+
+static int bridge_set_video_source_cb(struct stasis_app_control *control,
+	struct ast_channel *chan, void *data)
+{
+	struct ast_bridge *bridge = data;
+
+	ast_bridge_lock(bridge);
+	ast_bridge_set_single_src_video_mode(bridge, chan);
+	ast_bridge_unlock(bridge);
+
+	return 0;
+}
+
+void ast_ari_bridges_set_video_source(struct ast_variable *headers,
+	struct ast_ari_bridges_set_video_source_args *args, struct ast_ari_response *response)
+{
+	struct ast_bridge *bridge;
+	struct stasis_app_control *control;
+
+	bridge = find_bridge(response, args->bridge_id);
+	if (!bridge) {
+		return;
+	}
+
+	control = find_channel_control(response, args->channel_id);
+	if (!control) {
+		ao2_ref(bridge, -1);
+		return;
+	}
+
+	if (stasis_app_get_bridge(control) != bridge) {
+		ast_ari_response_error(response, 422,
+			"Unprocessable Entity",
+			"Channel not in this bridge");
+		ao2_ref(bridge, -1);
+		ao2_ref(control, -1);
+		return;
+	}
+
+	stasis_app_send_command(control, bridge_set_video_source_cb,
+		ao2_bump(bridge), __ao2_cleanup);
+
+	ao2_ref(bridge, -1);
+	ao2_ref(control, -1);
+
+	ast_ari_response_no_content(response);
+}
+
+void ast_ari_bridges_clear_video_source(struct ast_variable *headers,
+	struct ast_ari_bridges_clear_video_source_args *args, struct ast_ari_response *response)
+{
+	struct ast_bridge *bridge;
+
+	bridge = find_bridge(response, args->bridge_id);
+	if (!bridge) {
+		return;
+	}
+
+	ast_bridge_lock(bridge);
+	ast_bridge_set_talker_src_video_mode(bridge);
+	ast_bridge_unlock(bridge);
+
+	ao2_ref(bridge, -1);
+	ast_ari_response_no_content(response);
 }

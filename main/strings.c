@@ -37,11 +37,10 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include <regex.h>
 #include "asterisk/strings.h"
 #include "asterisk/pbx.h"
+#include "asterisk/vector.h"
 
 /*!
  * core handler for dynamic strings.
@@ -53,13 +52,9 @@ ASTERISK_REGISTER_FILE()
  *	ast_str_append_va(...)
  */
 
-#ifdef __AST_DEBUG_MALLOC
-int __ast_debug_str_helper(struct ast_str **buf, ssize_t max_len,
-	int append, const char *fmt, va_list ap, const char *file, int lineno, const char *function)
-#else
 int __ast_str_helper(struct ast_str **buf, ssize_t max_len,
-	int append, const char *fmt, va_list ap)
-#endif
+	int append, const char *fmt, va_list ap,
+	const char *file, int lineno, const char *function)
 {
 	int res;
 	int added;
@@ -111,13 +106,7 @@ int __ast_str_helper(struct ast_str **buf, ssize_t max_len,
 			need = max_len;
 		}
 
-		if (
-#ifdef __AST_DEBUG_MALLOC
-			_ast_str_make_space(buf, need, file, lineno, function)
-#else
-			ast_str_make_space(buf, need)
-#endif
-			) {
+		if (_ast_str_make_space(buf, need, file, lineno, function)) {
 			ast_log_safe(LOG_VERBOSE, "failed to extend from %d to %d\n",
 				(int) (*buf)->__AST_STR_LEN, need);
 
@@ -186,15 +175,32 @@ static int str_hash(const void *obj, const int flags)
 	return ast_str_hash(obj);
 }
 
+static int str_sort(const void *lhs, const void *rhs, int flags)
+{
+	if ((flags & OBJ_SEARCH_MASK) == OBJ_SEARCH_PARTIAL_KEY) {
+		return strncmp(lhs, rhs, strlen(rhs));
+	} else {
+		return strcmp(lhs, rhs);
+	}
+}
+
 static int str_cmp(void *lhs, void *rhs, int flags)
 {
-	return strcmp(lhs, rhs) ? 0 : CMP_MATCH;
+	int cmp = 0;
+
+	if ((flags & OBJ_SEARCH_MASK) == OBJ_SEARCH_PARTIAL_KEY) {
+		cmp = strncmp(lhs, rhs, strlen(rhs));
+	} else {
+		cmp = strcmp(lhs, rhs);
+	}
+
+	return cmp ? 0 : CMP_MATCH;
 }
 
 //struct ao2_container *ast_str_container_alloc_options(enum ao2_container_opts opts, int buckets)
 struct ao2_container *ast_str_container_alloc_options(enum ao2_alloc_opts opts, int buckets)
 {
-	return ao2_container_alloc_options(opts, buckets, str_hash, str_cmp);
+	return ao2_container_alloc_hash(opts, 0, buckets, str_hash, str_sort, str_cmp);
 }
 
 int ast_str_container_add(struct ao2_container *str_container, const char *add)
@@ -297,7 +303,7 @@ regex:
 	}
 
 equals:
-	scan_numeric = (sscanf(left, "%lf", &left_num) && sscanf(internal_right, "%lf", &right_num));
+	scan_numeric = (sscanf(left, "%lf", &left_num) > 0 && sscanf(internal_right, "%lf", &right_num) > 0);
 
 	if (internal_op[0] == '=') {
 		if (ast_strlen_zero(left) && ast_strlen_zero(internal_right)) {
@@ -354,4 +360,64 @@ equals:
 	return 0;
 }
 
+char *ast_read_line_from_buffer(char **buffer)
+{
+	char *start = *buffer;
 
+	if (!buffer || !*buffer || *(*buffer) == '\0') {
+		return NULL;
+	}
+
+	while (*(*buffer) && *(*buffer) != '\n' ) {
+		(*buffer)++;
+	}
+
+	*(*buffer) = '\0';
+	if (*(*buffer - 1) == '\r') {
+		*(*buffer - 1) = '\0';
+	}
+	(*buffer)++;
+
+	return start;
+}
+
+int ast_vector_string_split(struct ast_vector_string *dest,
+	const char *input, const char *delim, int flags,
+	int (*excludes_cmp)(const char *s1, const char *s2))
+{
+	char *buf;
+	char *cur;
+	int no_trim = flags & AST_VECTOR_STRING_SPLIT_NO_TRIM;
+	int allow_empty = flags & AST_VECTOR_STRING_SPLIT_ALLOW_EMPTY;
+
+	ast_assert(dest != NULL);
+	ast_assert(!ast_strlen_zero(delim));
+
+	if (ast_strlen_zero(input)) {
+		return 0;
+	}
+
+	buf = ast_strdupa(input);
+	while ((cur = strsep(&buf, delim))) {
+		if (!no_trim) {
+			cur = ast_strip(cur);
+		}
+
+		if (!allow_empty && ast_strlen_zero(cur)) {
+			continue;
+		}
+
+		if (excludes_cmp && AST_VECTOR_GET_CMP(dest, cur, !excludes_cmp)) {
+			continue;
+		}
+
+		cur = ast_strdup(cur);
+		if (!cur || AST_VECTOR_APPEND(dest, cur)) {
+			ast_free(cur);
+
+			return -1;
+		}
+	}
+
+	return 0;
+}

@@ -31,8 +31,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/app.h"
 #include "asterisk/astobj2.h"
 #include "asterisk/bridge.h"
@@ -113,9 +111,9 @@ static struct ast_json *playback_to_json(struct stasis_message *message,
 		return NULL;
 	}
 
-	return ast_json_pack("{s: s, s: o}",
+	return ast_json_pack("{s: s, s: O}",
 		"type", type,
-		"playback", ast_json_deep_copy(blob));
+		"playback", blob);
 }
 
 STASIS_MESSAGE_TYPE_DEFN(stasis_app_playback_snapshot_type,
@@ -499,7 +497,11 @@ struct stasis_app_playback *stasis_app_control_play_uri(
 
 	    /* safe */
 		strcpy(media_uri, media[i]);
-		AST_VECTOR_APPEND(&playback->medias, media_uri);
+		if (AST_VECTOR_APPEND(&playback->medias, media_uri)) {
+			ao2_ref(playback, -1);
+			ast_free(media_uri);
+			return NULL;
+		}
 	}
 
 	if (skipms == 0) {
@@ -733,13 +735,14 @@ static int load_module(void)
 
 	r = STASIS_MESSAGE_TYPE_INIT(stasis_app_playback_snapshot_type);
 	if (r != 0) {
-		return AST_MODULE_LOAD_FAILURE;
+		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	playbacks = ao2_container_alloc(PLAYBACK_BUCKETS, playback_hash,
 		playback_cmp);
 	if (!playbacks) {
-		return AST_MODULE_LOAD_FAILURE;
+		STASIS_MESSAGE_TYPE_CLEANUP(stasis_app_playback_snapshot_type);
+		return AST_MODULE_LOAD_DECLINE;
 	}
 	return AST_MODULE_LOAD_SUCCESS;
 }
@@ -756,5 +759,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS, "Stasis applicatio
 	.support_level = AST_MODULE_SUPPORT_CORE,
 	.load = load_module,
 	.unload = unload_module,
-	.nonoptreq = "res_stasis,res_stasis_recording"
+	.requires = "res_stasis,res_stasis_recording"
 );

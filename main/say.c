@@ -37,8 +37,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include <netinet/in.h>
 #include <time.h>
 #include <ctype.h>
@@ -483,73 +481,49 @@ static int say_number_full(struct ast_channel *chan, int num, const char *ints, 
 {
 	ast_test_suite_event_notify("SAYNUM", "Message: saying number %d\r\nNumber: %d\r\nChannel: %s", num, num, ast_channel_name(chan));
 	if (!strncasecmp(language, "en_GB", 5)) {     /* British syntax */
-	   return ast_say_number_full_en_GB(chan, num, ints, language, audiofd, ctrlfd);
+		return ast_say_number_full_en_GB(chan, num, ints, language, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "en", 2)) { /* English syntax */
-	   return ast_say_number_full_en(chan, num, ints, language, audiofd, ctrlfd);
+		return ast_say_number_full_en(chan, num, ints, language, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "cs", 2)) { /* Czech syntax */
-	   return ast_say_number_full_cs(chan, num, ints, language, options, audiofd, ctrlfd);
-	} else if (!strncasecmp(language, "cz", 2)) { /* deprecated Czech syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "cz is not a standard language code.  Please switch to using cs instead.\n");
-		}
 		return ast_say_number_full_cs(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "da", 2)) { /* Danish syntax */
-	   return ast_say_number_full_da(chan, num, ints, language, options, audiofd, ctrlfd);
+		return ast_say_number_full_da(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "de", 2)) { /* German syntax */
-	   return ast_say_number_full_de(chan, num, ints, language, options, audiofd, ctrlfd);
+		return ast_say_number_full_de(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "es", 2)) { /* Spanish syntax */
-	   return ast_say_number_full_es(chan, num, ints, language, options, audiofd, ctrlfd);
+		return ast_say_number_full_es(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "fr", 2)) { /* French syntax */
-	   return ast_say_number_full_fr(chan, num, ints, language, options, audiofd, ctrlfd);
-	} else if (!strncasecmp(language, "ge", 2)) { /* deprecated Georgian syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "ge is not a standard language code.  Please switch to using ka instead.\n");
-		}
-		return ast_say_number_full_ka(chan, num, ints, language, options, audiofd, ctrlfd);
+		return ast_say_number_full_fr(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "gr", 2)) { /* Greek syntax */
-	   return ast_say_number_full_gr(chan, num, ints, language, audiofd, ctrlfd);
+		return ast_say_number_full_gr(chan, num, ints, language, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "ja", 2)) { /* Japanese syntax */
-	   return ast_say_number_full_ja(chan, num, ints, language, audiofd, ctrlfd);
+		return ast_say_number_full_ja(chan, num, ints, language, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "he", 2)) { /* Hebrew syntax */
-	   return ast_say_number_full_he(chan, num, ints, language, options, audiofd, ctrlfd);
+		return ast_say_number_full_he(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "hu", 2)) { /* Hungarian syntax */
 		return ast_say_number_full_hu(chan, num, ints, language, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "is", 2)) { /* Icelandic syntax */
 		return ast_say_number_full_is(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "it", 2)) { /* Italian syntax */
-	   return ast_say_number_full_it(chan, num, ints, language, audiofd, ctrlfd);
+		return ast_say_number_full_it(chan, num, ints, language, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "ka", 2)) { /* Georgian syntax */
-	   return ast_say_number_full_ka(chan, num, ints, language, options, audiofd, ctrlfd);
-	} else if (!strncasecmp(language, "mx", 2)) { /* deprecated Mexican syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "mx is not a standard language code.  Please switch to using es_MX instead.\n");
-		}
-		return ast_say_number_full_es(chan, num, ints, language, options, audiofd, ctrlfd);
+		return ast_say_number_full_ka(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "nl", 2)) { /* Dutch syntax */
-	   return ast_say_number_full_nl(chan, num, ints, language, audiofd, ctrlfd);
+		return ast_say_number_full_nl(chan, num, ints, language, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "no", 2)) { /* Norwegian syntax */
-	   return ast_say_number_full_no(chan, num, ints, language, options, audiofd, ctrlfd);
+		return ast_say_number_full_no(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "pl", 2)) { /* Polish syntax */
-	   return ast_say_number_full_pl(chan, num, ints, language, options, audiofd, ctrlfd);
+		return ast_say_number_full_pl(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "pt", 2)) { /* Portuguese syntax */
-	   return ast_say_number_full_pt(chan, num, ints, language, options, audiofd, ctrlfd);
+		return ast_say_number_full_pt(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "ru", 2)) { /* Russian syntax */
-	   return ast_say_number_full_ru(chan, num, ints, language, options, audiofd, ctrlfd);
+		return ast_say_number_full_ru(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "se", 2)) { /* Swedish syntax */
-	   return ast_say_number_full_se(chan, num, ints, language, options, audiofd, ctrlfd);
+		return ast_say_number_full_se(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "th", 2)) { /* Thai syntax */
 		return ast_say_number_full_th(chan, num, ints, language, audiofd, ctrlfd);
-	} else if (!strncasecmp(language, "tw", 2)) { /* deprecated Taiwanese syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "tw is a standard language code for Twi, not Taiwanese.  Please switch to using zh_TW instead.\n");
-		}
-		return ast_say_number_full_zh(chan, num, ints, language, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "zh", 2)) { /* Taiwanese / Chinese syntax */
-	   return ast_say_number_full_zh(chan, num, ints, language, audiofd, ctrlfd);
+		return ast_say_number_full_zh(chan, num, ints, language, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "ur", 2)) { /* Urdu syntax */
 		return ast_say_number_full_ur(chan, num, ints, language, options, audiofd, ctrlfd);
 	} else if (!strncasecmp(language, "vi", 2)) { /* Vietnamese syntax */
@@ -1000,7 +974,7 @@ static int ast_say_number_full_de(struct ast_channel *chan, int num, const char 
 
 /*! \brief  ast_say_number_full_en_GB: British syntax
  New files:
-  - In addition to American English, the following sounds are required:  "and"
+  - In addition to American English, the following sounds are required:  "vm-and"
  */
 static int ast_say_number_full_en_GB(struct ast_channel *chan, int num, const char *ints, const char *language, int audiofd, int ctrlfd)
 {
@@ -1023,7 +997,7 @@ static int ast_say_number_full_en_GB(struct ast_channel *chan, int num, const ch
 			ast_copy_string(fn, "digits/hundred", sizeof(fn));
 			playh = 0;
 		} else if (playa) {
-			ast_copy_string(fn, "digits/and", sizeof(fn));
+			ast_copy_string(fn, "vm-and", sizeof(fn));
 			playa = 0;
 		} else if (num < 20) {
 			snprintf(fn, sizeof(fn), "digits/%d", num);
@@ -3647,12 +3621,6 @@ static int say_date(struct ast_channel *chan, time_t t, const char *ints, const 
 		return ast_say_date_de(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "fr", 2)) { /* French syntax */
 		return ast_say_date_fr(chan, t, ints, lang);
-	} else if (!strncasecmp(lang, "ge", 2)) { /* deprecated Georgian syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "ge is not a standard language code.  Please switch to using ka instead.\n");
-		}
-		return ast_say_date_ka(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "gr", 2)) { /* Greek syntax */
 		return ast_say_date_gr(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "ja", 2)) { /* Japanese syntax */
@@ -4032,7 +4000,7 @@ int ast_say_date_is(struct ast_channel *chan, time_t t, const char *ints, const 
 				if (!res) {
 					res = wait_file(chan, ints, "digits/hundred", lang);
 					if (!res && year % 100 != 0) {
-						res = ast_say_number(chan, (year % 100), ints, lang, (char *) NULL);	
+						res = ast_say_number(chan, (year % 100), ints, lang, (char *) NULL);
 					}
 				}
 			}
@@ -4063,12 +4031,6 @@ static int say_date_with_format(struct ast_channel *chan, time_t t, const char *
 		return ast_say_date_with_format_ja(chan, t, ints, lang, format, tzone);
 	} else if (!strncasecmp(lang, "it", 2)) { /* Italian syntax */
 		return ast_say_date_with_format_it(chan, t, ints, lang, format, tzone);
-	} else if (!strncasecmp(lang, "mx", 2)) { /* deprecated Mexican syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "mx is not a standard language code.  Please switch to using es_MX instead.\n");
-		}
-		return ast_say_date_with_format_es(chan, t, ints, lang, format, tzone);
 	} else if (!strncasecmp(lang, "nl", 2)) { /* Dutch syntax */
 		return ast_say_date_with_format_nl(chan, t, ints, lang, format, tzone);
 	} else if (!strncasecmp(lang, "pl", 2)) { /* Polish syntax */
@@ -4077,12 +4039,6 @@ static int say_date_with_format(struct ast_channel *chan, time_t t, const char *
 		return ast_say_date_with_format_pt(chan, t, ints, lang, format, tzone);
 	} else if (!strncasecmp(lang, "th", 2)) { /* Thai syntax */
 		return ast_say_date_with_format_th(chan, t, ints, lang, format, tzone);
-	} else if (!strncasecmp(lang, "tw", 2)) { /* deprecated Taiwanese syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "tw is a standard language code for Twi, not Taiwanese.  Please switch to using zh_TW instead.\n");
-		}
-		return ast_say_date_with_format_zh(chan, t, ints, lang, format, tzone);
 	} else if (!strncasecmp(lang, "zh", 2)) { /* Taiwanese / Chinese syntax */
 		return ast_say_date_with_format_zh(chan, t, ints, lang, format, tzone);
 	} else if (!strncasecmp(lang, "vi", 2)) { /* Vietnamese syntax */
@@ -4443,9 +4399,9 @@ int ast_say_date_with_format_da(struct ast_channel *chan, time_t t, const char *
 				}
 				if (!res && next_item(&format[offset + 1]) == 'S') { /* minutes only if seconds follow */
 					if (tm.tm_min == 1) {
-						res = wait_file(chan, ints, "digits/minute", lang);
+						res = wait_file(chan, ints, "minute", lang);
 					} else {
-						res = wait_file(chan, ints, "digits/minutes", lang);
+						res = wait_file(chan, ints, "minutes", lang);
 					}
 				}
 				break;
@@ -4519,7 +4475,7 @@ int ast_say_date_with_format_da(struct ast_channel *chan, time_t t, const char *
 				if (!res) {
 					res = ast_say_number(chan, tm.tm_sec, ints, lang, "f");
 					if (!res) {
-						res = wait_file(chan, ints, "digits/seconds", lang);
+						res = wait_file(chan, ints, "seconds", lang);
 					}
 				}
 				break;
@@ -4639,16 +4595,16 @@ int ast_say_date_with_format_de(struct ast_channel *chan, time_t t, const char *
 			case 'M':
 				/* Minute */
 				if (next_item(&format[offset + 1]) == 'S') { /* zero 'digits/0' only if seconds follow */
-					res = ast_say_number(chan, tm.tm_min, ints, lang, "f"); /* female only if we say digits/minutes */
+					res = ast_say_number(chan, tm.tm_min, ints, lang, "f"); /* female only if we say minutes */
 				} else if (tm.tm_min > 0) {
 					res = ast_say_number(chan, tm.tm_min, ints, lang, (char *) NULL);
 				}
 
 				if (!res && next_item(&format[offset + 1]) == 'S') { /* minutes only if seconds follow */
 					if (tm.tm_min == 1) {
-						res = wait_file(chan, ints, "digits/minute", lang);
+						res = wait_file(chan, ints, "minute", lang);
 					} else {
-						res = wait_file(chan, ints, "digits/minutes", lang);
+						res = wait_file(chan, ints, "minutes", lang);
 					}
 				}
 				break;
@@ -4722,7 +4678,7 @@ int ast_say_date_with_format_de(struct ast_channel *chan, time_t t, const char *
 				if (!res) {
 					res = ast_say_number(chan, tm.tm_sec, ints, lang, "f");
 					if (!res) {
-						res = wait_file(chan, ints, tm.tm_sec == 1 ? "digits/second" : "digits/seconds", lang);
+						res = wait_file(chan, ints, tm.tm_sec == 1 ? "second" : "seconds", lang);
 					}
 				}
 				break;
@@ -4797,7 +4753,7 @@ int ast_say_date_with_format_is(struct ast_channel *chan, time_t t, const char *
 				{
 					int year = tm.tm_year + 1900;
 					if (year > 1999) {	/* year 2000 and later */
-						res = ast_say_number(chan, year, ints, lang, (char *) NULL);	
+						res = ast_say_number(chan, year, ints, lang, (char *) NULL);
 					} else {
 						if (year < 1100) {
 							/* I'm not going to handle 1100 and prior */
@@ -4810,7 +4766,7 @@ int ast_say_date_with_format_is(struct ast_channel *chan, time_t t, const char *
 							if (!res) {
 								res = wait_file(chan, ints, "digits/hundred", lang);
 								if (!res && year % 100 != 0) {
-									res = ast_say_number(chan, (year % 100), ints, lang, (char *) NULL);	
+									res = ast_say_number(chan, (year % 100), ints, lang, (char *) NULL);
 								}
 							}
 						}
@@ -4855,9 +4811,9 @@ int ast_say_date_with_format_is(struct ast_channel *chan, time_t t, const char *
 				if (!res && next_item(&format[offset + 1]) == 'S') { /* minutes only if seconds follow */
 					/* Say minute/minutes depending on whether minutes end in 1 */
 					if ((tm.tm_min % 10 == 1) && (tm.tm_min != 11)) {
-						res = wait_file(chan, ints, "digits/minute", lang);
+						res = wait_file(chan, ints, "minute", lang);
 					} else {
-						res = wait_file(chan, ints, "digits/minutes", lang);
+						res = wait_file(chan, ints, "minutes", lang);
 					}
 				}
 				break;
@@ -4932,9 +4888,9 @@ int ast_say_date_with_format_is(struct ast_channel *chan, time_t t, const char *
 					res = ast_say_number(chan, tm.tm_sec, ints, lang, "f");
 					/* Say minute/minutes depending on whether seconds end in 1 */
 					if (!res && (tm.tm_sec % 10 == 1) && (tm.tm_sec != 11)) {
-						res = wait_file(chan, ints, "digits/second", lang);
+						res = wait_file(chan, ints, "second", lang);
 					} else {
-						res = wait_file(chan, ints, "digits/seconds", lang);
+						res = wait_file(chan, ints, "seconds", lang);
 					}
 				}
 				break;
@@ -5654,7 +5610,7 @@ int ast_say_date_with_format_fr(struct ast_channel *chan, time_t t, const char *
 				/* Seconds */
 				res = ast_say_number(chan, tm.tm_sec, ints, lang, (char * ) NULL);
 				if (!res) {
-					res = wait_file(chan, ints, "digits/second", lang);
+					res = wait_file(chan, ints, "second", lang);
 				}
 				break;
 			case 'T':
@@ -6305,9 +6261,9 @@ int ast_say_date_with_format_pl(struct ast_channel *chan, time_t thetime, const 
 							one = tm.tm_sec % 10;
 
 							if (one > 1 && one < 5 && ten != 1)
-								res = wait_file(chan, ints, "digits/seconds", lang);
+								res = wait_file(chan, ints, "seconds", lang);
 							else
-								res = wait_file(chan, ints, "digits/second", lang);
+								res = wait_file(chan, ints, "second", lang);
 						}
 					}
 				}
@@ -6471,9 +6427,9 @@ int ast_say_date_with_format_pt(struct ast_channel *chan, time_t t, const char *
 					res = ast_say_number(chan, tm.tm_min, ints, lang, NULL);
 					if (!res) {
 						if (tm.tm_min > 1) {
-							res = wait_file(chan, ints, "digits/minutes", lang);
+							res = wait_file(chan, ints, "minutes", lang);
 						} else {
-							res = wait_file(chan, ints, "digits/minute", lang);
+							res = wait_file(chan, ints, "minute", lang);
 						}
 					}
 				} else {
@@ -6569,9 +6525,9 @@ int ast_say_date_with_format_pt(struct ast_channel *chan, time_t t, const char *
 					res = ast_say_number(chan, tm.tm_sec, ints, lang, NULL);
 					if (!res) {
 						if (tm.tm_sec > 1) {
-							res = wait_file(chan, ints, "digits/seconds", lang);
+							res = wait_file(chan, ints, "seconds", lang);
 						} else {
-							res = wait_file(chan, ints, "digits/second", lang);
+							res = wait_file(chan, ints, "second", lang);
 						}
 					}
 				} else {
@@ -6785,7 +6741,7 @@ int ast_say_date_with_format_zh(struct ast_channel *chan, time_t t, const char *
 					}
 				}
 				if (!res) {
-					res = wait_file(chan, ints, "digits/minute", lang);
+					res = wait_file(chan, ints, "minute", lang);
 				}
 				break;
 			case 'P':
@@ -6869,7 +6825,7 @@ int ast_say_date_with_format_zh(struct ast_channel *chan, time_t t, const char *
 					}
 				}
 				if (!res) {
-					res = wait_file(chan, ints, "digits/second", lang);
+					res = wait_file(chan, ints, "second", lang);
 				}
 				break;
 			case 'T':
@@ -6899,12 +6855,6 @@ static int say_time(struct ast_channel *chan, time_t t, const char *ints, const 
 		return ast_say_time_de(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "fr", 2)) { /* French syntax */
 		return ast_say_time_fr(chan, t, ints, lang);
-	} else if (!strncasecmp(lang, "ge", 2)) { /* deprecated Georgian syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "ge is not a standard language code.  Please switch to using ka instead.\n");
-		}
-		return ast_say_time_ka(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "gr", 2)) { /* Greek syntax */
 		return ast_say_time_gr(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "ja", 2)) { /* Japanese syntax */
@@ -6923,12 +6873,6 @@ static int say_time(struct ast_channel *chan, time_t t, const char *ints, const 
 		return ast_say_time_pt(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "th", 2)) { /* Thai syntax */
 		return(ast_say_time_th(chan, t, ints, lang));
-	} else if (!strncasecmp(lang, "tw", 2)) { /* deprecated Taiwanese syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "tw is a standard language code for Twi, not Taiwanese.  Please switch to using zh_TW instead.\n");
-		}
-		return ast_say_time_zh(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "zh", 2)) { /* Taiwanese / Chinese syntax */
 		return ast_say_time_zh(chan, t, ints, lang);
 	}
@@ -7024,7 +6968,7 @@ int ast_say_time_hu(struct ast_channel *chan, time_t t, const char *ints, const 
 	    if (tm.tm_min > 0) {
 			res = ast_say_number(chan, tm.tm_min, ints, lang, "f");
 			if (!res)
-				res = ast_streamfile(chan, "digits/minute", lang);
+				res = ast_streamfile(chan, "minute", lang);
 		}
 	return res;
 }
@@ -7119,9 +7063,9 @@ int ast_say_time_pt_BR(struct ast_channel *chan, time_t t, const char *ints, con
 			res = ast_say_number(chan, tm.tm_min, ints, lang, (char *) NULL);
 		if (!res) {
 			if (tm.tm_min > 1)
-				res = wait_file(chan, ints, "digits/minutes", lang);
+				res = wait_file(chan, ints, "minutes", lang);
 			else
-				res = wait_file(chan, ints, "digits/minute", lang);
+				res = wait_file(chan, ints, "minute", lang);
 		}
 	}
 	return res;
@@ -7181,7 +7125,7 @@ int ast_say_time_zh(struct ast_channel *chan, time_t t, const char *ints, const 
 	if (!res)
 		res = ast_say_number(chan, tm.tm_min, ints, lang, (char *) NULL);
 	if (!res)
-		res = ast_streamfile(chan, "digits/minute", lang);
+		res = ast_streamfile(chan, "minute", lang);
 	if (!res)
 		res = ast_waitstream(chan, ints);
 	return res;
@@ -7232,12 +7176,6 @@ static int say_datetime(struct ast_channel *chan, time_t t, const char *ints, co
 		return ast_say_datetime_de(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "fr", 2)) { /* French syntax */
 		return ast_say_datetime_fr(chan, t, ints, lang);
-	} else if (!strncasecmp(lang, "ge", 2)) { /* deprecated Georgian syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "ge is not a standard language code.  Please switch to using ka instead.\n");
-		}
-		return ast_say_datetime_ka(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "gr", 2)) { /* Greek syntax */
 		return ast_say_datetime_gr(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "ja", 2)) { /* Japanese syntax */
@@ -7256,12 +7194,6 @@ static int say_datetime(struct ast_channel *chan, time_t t, const char *ints, co
 		return ast_say_datetime_pt(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "th", 2)) { /* Thai syntax */
 		return ast_say_datetime_th(chan, t, ints, lang);
-	} else if (!strncasecmp(lang, "tw", 2)) { /* deprecated Taiwanese syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "tw is a standard language code for Twi, not Taiwanese.  Please switch to using zh_TW instead.\n");
-		}
-		return ast_say_datetime_zh(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "zh", 2)) { /* Taiwanese / Chinese syntax */
 		return ast_say_datetime_zh(chan, t, ints, lang);
 	}
@@ -7604,7 +7536,7 @@ int ast_say_datetime_zh(struct ast_channel *chan, time_t t, const char *ints, co
 	if (!res)
 		res = ast_say_number(chan, tm.tm_min, ints, lang, (char *) NULL);
 	if (!res)
-		res = ast_streamfile(chan, "digits/minute", lang);
+		res = ast_streamfile(chan, "minute", lang);
 	if (!res)
 		res = ast_waitstream(chan, ints);
 	return res;
@@ -7682,12 +7614,6 @@ static int say_datetime_from_now(struct ast_channel *chan, time_t t, const char 
 		return ast_say_datetime_from_now_en(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "fr", 2)) { /* French syntax */
 		return ast_say_datetime_from_now_fr(chan, t, ints, lang);
-	} else if (!strncasecmp(lang, "ge", 2)) { /* deprecated Georgian syntax */
-		static int deprecation_warning = 0;
-		if (deprecation_warning++ % 10 == 0) {
-			ast_log(LOG_WARNING, "ge is not a standard language code.  Please switch to using ka instead.\n");
-		}
-		return ast_say_datetime_from_now_ka(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "he", 2)) { /* Hebrew syntax */
 		return ast_say_datetime_from_now_he(chan, t, ints, lang);
 	} else if (!strncasecmp(lang, "ka", 2)) { /* Georgian syntax */
@@ -8482,7 +8408,7 @@ static int ast_say_date_with_format_gr(struct ast_channel *chan, time_t t, const
 			if (!res)
 				res = ast_say_number_full_gr(chan, tm.tm_sec, ints, lang, -1, -1);
 			if (!res)
-				ast_copy_string(nextmsg, "digits/seconds", sizeof(nextmsg));
+				ast_copy_string(nextmsg, "seconds", sizeof(nextmsg));
 			res = wait_file(chan, ints, nextmsg, lang);
 			break;
 		case 'T':

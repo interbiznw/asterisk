@@ -19,7 +19,6 @@
 /*** MODULEINFO
 	<depend>pjproject</depend>
 	<depend>res_pjsip</depend>
-	<depend>res_pjsip_session</depend>
 	<support_level>core</support_level>
  ***/
 
@@ -46,10 +45,28 @@ static void set_id_from_hdr(pjsip_fromto_hdr *hdr, struct ast_party_id *id)
 	char cid_num[AST_CHANNEL_NAME];
 	pjsip_sip_uri *uri;
 	pjsip_name_addr *id_name_addr = (pjsip_name_addr *) hdr->uri;
+	char *semi;
 
 	uri = pjsip_uri_get_uri(id_name_addr);
 	ast_copy_pj_str(cid_name, &id_name_addr->display, sizeof(cid_name));
 	ast_copy_pj_str(cid_num, &uri->user, sizeof(cid_num));
+
+	/* Always truncate caller-id number at a semicolon. */
+	semi = strchr(cid_num, ';');
+	if (semi) {
+		/*
+		 * We need to be able to handle URI's looking like
+		 * "sip:1235557890;phone-context=national@x.x.x.x;user=phone"
+		 *
+		 * Where the uri->user field will result in:
+		 * "1235557890;phone-context=national"
+		 *
+		 * People don't care about anything after the semicolon
+		 * showing up on their displays even though the RFC
+		 * allows the semicolon.
+		 */
+		*semi = '\0';
+	}
 
 	ast_free(id->name.str);
 	id->name.str = ast_strdup(cid_name);
@@ -131,12 +148,12 @@ static int set_id_from_pai(pjsip_rx_data *rdata, struct ast_party_id *id)
 	}
 
 	privacy = pjsip_msg_find_hdr_by_name(rdata->msg_info.msg, &privacy_str, NULL);
-	if (privacy && !pj_stricmp2(&privacy->hvalue, "id")) {
-		id->number.presentation = AST_PRES_PROHIB_USER_NUMBER_NOT_SCREENED;
-		id->name.presentation = AST_PRES_PROHIB_USER_NUMBER_NOT_SCREENED;
-	} else {
+	if (!privacy || !pj_stricmp2(&privacy->hvalue, "none")) {
 		id->number.presentation = AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED;
 		id->name.presentation = AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED;
+	} else {
+		id->number.presentation = AST_PRES_PROHIB_USER_NUMBER_NOT_SCREENED;
+		id->name.presentation = AST_PRES_PROHIB_USER_NUMBER_NOT_SCREENED;
 	}
 
 	return 0;
@@ -324,7 +341,8 @@ static void update_incoming_connected_line(struct ast_sip_session *session, pjsi
 {
 	struct ast_party_id id;
 
-	if (!session->endpoint->id.trust_inbound) {
+	if (!session->endpoint->id.trust_connected_line
+		|| !session->endpoint->id.trust_inbound) {
 		return;
 	}
 
@@ -418,7 +436,7 @@ static pjsip_fromto_hdr *create_new_id_hdr(const pj_str_t *hdr_name, pjsip_fromt
 	id_name_addr = pjsip_uri_clone(tdata->pool, base->uri);
 	id_uri = pjsip_uri_get_uri(id_name_addr->uri);
 
-	if (id->name.valid) {
+	if (id->name.valid && !ast_strlen_zero(id->name.str)) {
 		int name_buf_len = strlen(id->name.str) * 2 + 1;
 		char *name_buf = ast_alloca(name_buf_len);
 
@@ -432,7 +450,12 @@ static pjsip_fromto_hdr *create_new_id_hdr(const pj_str_t *hdr_name, pjsip_fromt
 		pj_strdup2(tdata->pool, &id_name_addr->display, NULL);
 	}
 
-	pj_strdup2(tdata->pool, &id_uri->user, id->number.str);
+	if (id->number.valid) {
+		pj_strdup2(tdata->pool, &id_uri->user, id->number.str);
+	} else {
+		/* Similar to name, make sure the number is also cleared when invalid */
+		pj_strdup2(tdata->pool, &id_uri->user, NULL);
+	}
 
 	id_hdr->uri = (pjsip_uri *) id_name_addr;
 	return id_hdr;
@@ -505,8 +528,11 @@ static void add_pai_header(const struct ast_sip_session *session, pjsip_tx_data 
 		}
 	}
 
-	base = tdata->msg->type == PJSIP_REQUEST_MSG ? session->saved_from_hdr :
-		PJSIP_MSG_TO_HDR(tdata->msg);
+	if (tdata->msg->type == PJSIP_REQUEST_MSG) {
+		base = session->saved_from_hdr ? session->saved_from_hdr : PJSIP_MSG_FROM_HDR(tdata->msg);
+	} else {
+		base = PJSIP_MSG_TO_HDR(tdata->msg);
+	}
 
 	pai_hdr = create_new_id_hdr(&pj_pai_name, base, tdata, id);
 	if (!pai_hdr) {
@@ -515,6 +541,33 @@ static void add_pai_header(const struct ast_sip_session *session, pjsip_tx_data 
 	add_privacy_header(tdata, id);
 
 	pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)pai_hdr);
+}
+
+/*!
+ * \internal
+ * \brief Add party parameter to a Remote-Party-ID header.
+ *
+ * \param tdata The message where the Remote-Party-ID header is
+ * \param hdr The header on which the parameters are being added
+ * \param session The session involved
+ */
+static void add_party_param(pjsip_tx_data *tdata, pjsip_fromto_hdr *hdr, const struct ast_sip_session *session)
+{
+	static const pj_str_t party_str = { "party", 5 };
+	static const pj_str_t calling_str = { "calling", 7 };
+	static const pj_str_t called_str = { "called", 6 };
+	pjsip_param *party;
+
+	/* The party value can't change throughout the lifetime, so it is set only once */
+	party = pjsip_param_find(&hdr->other_param, &party_str);
+	if (party) {
+		return;
+	}
+
+	party = PJ_POOL_ALLOC_T(tdata->pool, pjsip_param);
+	party->name = party_str;
+	party->value = (session->inv_session->role == PJSIP_ROLE_UAC) ? calling_str : called_str;
+	pj_list_insert_before(&hdr->other_param, party);
 }
 
 /*!
@@ -606,18 +659,23 @@ static void add_rpid_header(const struct ast_sip_session *session, pjsip_tx_data
 			pj_list_erase(old_rpid);
 		} else {
 			ast_sip_modify_id_header(tdata->pool, old_rpid, id);
+			add_party_param(tdata, old_rpid, session);
 			add_privacy_params(tdata, old_rpid, id);
 			return;
 		}
 	}
 
-	base = tdata->msg->type == PJSIP_REQUEST_MSG ? session->saved_from_hdr :
-		PJSIP_MSG_TO_HDR(tdata->msg);
+	if (tdata->msg->type == PJSIP_REQUEST_MSG) {
+		base = session->saved_from_hdr ? session->saved_from_hdr : PJSIP_MSG_FROM_HDR(tdata->msg);
+	} else {
+		base = PJSIP_MSG_TO_HDR(tdata->msg);
+	}
 
 	rpid_hdr = create_new_id_hdr(&pj_rpid_name, base, tdata, id);
 	if (!rpid_hdr) {
 		return;
 	}
+	add_party_param(tdata, rpid_hdr, session);
 	add_privacy_params(tdata, rpid_hdr, id);
 	pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)rpid_hdr);
 }
@@ -692,7 +750,10 @@ static void caller_id_outgoing_response(struct ast_sip_session *session, pjsip_t
 	struct ast_party_id effective_id;
 	struct ast_party_id connected_id;
 
-	if (!session->channel) {
+	if (!session->channel
+		|| (!session->endpoint->id.send_connected_line
+			&& session->inv_session
+			&& session->inv_session->state >= PJSIP_INV_STATE_EARLY)) {
 		return;
 	}
 
@@ -718,8 +779,6 @@ static struct ast_sip_session_supplement caller_id_supplement = {
 
 static int load_module(void)
 {
-	CHECK_PJSIP_SESSION_MODULE_LOADED();
-
 	ast_sip_session_register_supplement(&caller_id_supplement);
 	return AST_MODULE_LOAD_SUCCESS;
 }
@@ -735,4 +794,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "PJSIP Caller ID Suppo
 	.load = load_module,
 	.unload = unload_module,
 	.load_pri = AST_MODPRI_APP_DEPEND,
+	.requires = "res_pjsip",
 );

@@ -29,8 +29,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/mod_format.h"
 #include "asterisk/module.h"
 #include "asterisk/format_cache.h"
@@ -314,21 +312,6 @@ static struct ast_format_def speex32_f = {
 	.desc_size = sizeof(struct speex_desc),
 };
 
-static int load_module(void)
-{
-	speex_f.format = ast_format_speex;
-	speex16_f.format = ast_format_speex16;
-	speex32_f.format = ast_format_speex32;
-
-	if (ast_format_def_register(&speex_f) ||
-	    ast_format_def_register(&speex16_f) ||
-	    ast_format_def_register(&speex32_f)) {
-		return AST_MODULE_LOAD_FAILURE;
-	}
-
-	return AST_MODULE_LOAD_SUCCESS;
-}
-
 static int unload_module(void)
 {
 	int res = 0;
@@ -338,7 +321,24 @@ static int unload_module(void)
 	return res;
 }
 
+static int load_module(void)
+{
+	speex_f.format = ast_format_speex;
+	speex16_f.format = ast_format_speex16;
+	speex32_f.format = ast_format_speex32;
+
+	if (ast_format_def_register(&speex_f) ||
+	    ast_format_def_register(&speex16_f) ||
+	    ast_format_def_register(&speex32_f)) {
+		unload_module();
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
+	return AST_MODULE_LOAD_SUCCESS;
+}
+
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "OGG/Speex audio",
+	.support_level = AST_MODULE_SUPPORT_EXTENDED,
 	.load = load_module,
 	.unload = unload_module,
 	.load_pri = AST_MODPRI_APP_DEPEND

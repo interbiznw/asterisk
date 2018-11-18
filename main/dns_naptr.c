@@ -29,9 +29,8 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include <arpa/nameser.h>
+#include <netinet/in.h>
 #include <resolv.h>
 #include <regex.h>
 
@@ -394,6 +393,7 @@ struct ast_dns_record *dns_naptr_alloc(struct ast_dns_query *query, const char *
 	int replacement_size;
 	const char *end_of_record;
 	enum flags_result flags_res;
+	size_t naptr_len;
 
 	ptr = dns_find_record(data, size, query->result->answer, query->result->answer_size);
 	ast_assert(ptr != NULL);
@@ -436,7 +436,14 @@ struct ast_dns_record *dns_naptr_alloc(struct ast_dns_query *query, const char *
 		return NULL;
 	}
 
-	replacement_size = dn_expand((unsigned char *)query->result->answer, (unsigned char *) end_of_record, (unsigned char *) ptr, replacement, sizeof(replacement) - 1);
+	/*
+	 * The return value from dn_expand represents the size of the replacement
+	 * in the buffer which MAY be compressed.  Since the expanded replacement
+	 * is NULL terminated, you can use strlen() to get the expanded size.
+	 */
+	replacement_size = dn_expand((unsigned char *)query->result->answer,
+		(unsigned char *) end_of_record, (unsigned char *) ptr,
+		replacement, sizeof(replacement) - 1);
 	if (replacement_size < 0) {
 		ast_log(LOG_ERROR, "Failed to expand domain name: %s\n", strerror(errno));
 		return NULL;
@@ -476,7 +483,9 @@ struct ast_dns_record *dns_naptr_alloc(struct ast_dns_query *query, const char *
 		return NULL;
 	}
 
-	naptr = ast_calloc(1, sizeof(*naptr) + size + flags_size + 1 + services_size + 1 + regexp_size + 1 + replacement_size + 1);
+	naptr_len = sizeof(*naptr) + size + flags_size + 1 + services_size + 1
+		+ regexp_size + 1 + strlen(replacement) + 1;
+	naptr = ast_calloc(1, naptr_len);
 	if (!naptr) {
 		return NULL;
 	}
@@ -592,7 +601,7 @@ const char *ast_dns_naptr_get_flags(const struct ast_dns_record *record)
 {
 	struct ast_dns_naptr_record *naptr = (struct ast_dns_naptr_record *) record;
 
-	ast_assert(ast_dns_record_get_rr_type(record) == ns_t_naptr);
+	ast_assert(ast_dns_record_get_rr_type(record) == T_NAPTR);
 	return naptr->flags;
 }
 
@@ -600,7 +609,7 @@ const char *ast_dns_naptr_get_service(const struct ast_dns_record *record)
 {
 	struct ast_dns_naptr_record *naptr = (struct ast_dns_naptr_record *) record;
 
-	ast_assert(ast_dns_record_get_rr_type(record) == ns_t_naptr);
+	ast_assert(ast_dns_record_get_rr_type(record) == T_NAPTR);
 	return naptr->service;
 }
 
@@ -608,7 +617,7 @@ const char *ast_dns_naptr_get_regexp(const struct ast_dns_record *record)
 {
 	struct ast_dns_naptr_record *naptr = (struct ast_dns_naptr_record *) record;
 
-	ast_assert(ast_dns_record_get_rr_type(record) == ns_t_naptr);
+	ast_assert(ast_dns_record_get_rr_type(record) == T_NAPTR);
 	return naptr->regexp;
 }
 
@@ -616,7 +625,7 @@ const char *ast_dns_naptr_get_replacement(const struct ast_dns_record *record)
 {
 	struct ast_dns_naptr_record *naptr = (struct ast_dns_naptr_record *) record;
 
-	ast_assert(ast_dns_record_get_rr_type(record) == ns_t_naptr);
+	ast_assert(ast_dns_record_get_rr_type(record) == T_NAPTR);
 	return naptr->replacement;
 }
 
@@ -624,7 +633,7 @@ unsigned short ast_dns_naptr_get_order(const struct ast_dns_record *record)
 {
 	struct ast_dns_naptr_record *naptr = (struct ast_dns_naptr_record *) record;
 
-	ast_assert(ast_dns_record_get_rr_type(record) == ns_t_naptr);
+	ast_assert(ast_dns_record_get_rr_type(record) == T_NAPTR);
 	return naptr->order;
 }
 
@@ -632,6 +641,6 @@ unsigned short ast_dns_naptr_get_preference(const struct ast_dns_record *record)
 {
 	struct ast_dns_naptr_record *naptr = (struct ast_dns_naptr_record *) record;
 
-	ast_assert(ast_dns_record_get_rr_type(record) == ns_t_naptr);
+	ast_assert(ast_dns_record_get_rr_type(record) == T_NAPTR);
 	return naptr->preference;
 }

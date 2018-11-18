@@ -29,8 +29,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/_private.h"
 #include "asterisk/pbx.h"
 #include "pbx_private.h"
@@ -104,4 +102,3 @@ void sw_free(struct ast_sw *sw)
 {
 	ast_free(sw);
 }
-

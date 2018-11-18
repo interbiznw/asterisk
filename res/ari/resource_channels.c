@@ -24,16 +24,10 @@
  */
 
 /*** MODULEINFO
-	<depend type="module">res_stasis_answer</depend>
-	<depend type="module">res_stasis_playback</depend>
-	<depend type="module">res_stasis_recording</depend>
-	<depend type="module">res_stasis_snoop</depend>
 	<support_level>core</support_level>
  ***/
 
 #include "asterisk.h"
-
-ASTERISK_REGISTER_FILE()
 
 #include "asterisk/file.h"
 #include "asterisk/pbx.h"
@@ -101,8 +95,12 @@ static int channel_state_invalid(struct stasis_app_control *control,
 		|| snapshot->state == AST_STATE_RINGING) {
 		ast_ari_response_error(response, 412, "Precondition Failed",
 			"Channel in invalid state");
+		ao2_ref(snapshot, -1);
+
 		return -1;
 	}
+
+	ao2_ref(snapshot, -1);
 
 	return 0;
 }
@@ -1230,7 +1228,12 @@ static void ari_channels_handle_originate_with_id(const char *args_endpoint,
 	}
 
 	if (ast_dial_prerun(dial, other, format_cap)) {
-		ast_ari_response_alloc_failed(response);
+		if (ast_channel_errno() == AST_CHANNEL_ERROR_ID_EXISTS) {
+			ast_ari_response_error(response, 409, "Conflict",
+				"Channel with given unique ID already exists");
+		} else {
+			ast_ari_response_alloc_failed(response);
+		}
 		ast_dial_destroy(dial);
 		ast_free(origination);
 		ast_channel_cleanup(other);
@@ -1823,7 +1826,12 @@ void ast_ari_channels_create(struct ast_variable *headers,
 	ao2_cleanup(request_cap);
 
 	if (!chan_data->chan) {
-		ast_ari_response_alloc_failed(response);
+		if (ast_channel_errno() == AST_CHANNEL_ERROR_ID_EXISTS) {
+			ast_ari_response_error(response, 409, "Conflict",
+				"Channel with given unique ID already exists");
+		} else {
+			ast_ari_response_alloc_failed(response);
+		}
 		ast_channel_cleanup(originator);
 		chan_data_destroy(chan_data);
 		return;

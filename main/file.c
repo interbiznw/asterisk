@@ -29,8 +29,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -335,19 +333,20 @@ static char *build_filename(const char *filename, const char *ext)
 
 /* compare type against the list 'exts' */
 /* XXX need a better algorithm */
-static int exts_compare(const char *exts, const char *type)
+static int type_in_list(const char *list, const char *type, int (*cmp)(const char *s1, const char *s2))
 {
-	char tmp[256];
-	char *stringp = tmp, *ext;
+	char *stringp = ast_strdupa(list), *item;
 
-	ast_copy_string(tmp, exts, sizeof(tmp));
-	while ((ext = strsep(&stringp, "|"))) {
-		if (!strcmp(ext, type))
+	while ((item = strsep(&stringp, "|"))) {
+		if (!cmp(item, type)) {
 			return 1;
+		}
 	}
 
 	return 0;
 }
+
+#define exts_compare(list, type) (type_in_list((list), (type), strcmp))
 
 /*!
  * \internal
@@ -427,11 +426,17 @@ static void filestream_destructor(void *arg)
 static struct ast_filestream *get_filestream(struct ast_format_def *fmt, FILE *bfile)
 {
 	struct ast_filestream *s;
-
 	int l = sizeof(*s) + fmt->buf_size + fmt->desc_size;	/* total allocation size */
-	if ( (s = ao2_alloc(l, filestream_destructor)) == NULL)
+
+	if (!ast_module_running_ref(fmt->module)) {
 		return NULL;
-	ast_module_ref(fmt->module);
+	}
+
+	s = ao2_alloc(l, filestream_destructor);
+	if (!s) {
+		ast_module_unref(fmt->module);
+		return NULL;
+	}
 	s->fmt = fmt;
 	s->f = bfile;
 
@@ -1095,6 +1100,143 @@ int ast_filecopy(const char *filename, const char *filename2, const char *fmt)
 	return filehelper(filename, filename2, fmt, ACTION_COPY);
 }
 
+static int __ast_file_read_dirs(const char *path, ast_file_on_file on_file,
+				void *obj, int max_depth)
+{
+	DIR *dir;
+	struct dirent *entry;
+	int res;
+
+	if (!(dir = opendir(path))) {
+		ast_log(LOG_ERROR, "Error opening directory - %s: %s\n",
+			path, strerror(errno));
+		return -1;
+	}
+
+	--max_depth;
+
+	res = 0;
+
+	while ((entry = readdir(dir)) != NULL && !errno) {
+		int is_file = 0;
+		int is_dir = 0;
+		RAII_VAR(char *, full_path, NULL, ast_free);
+
+		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) {
+			continue;
+		}
+
+/*
+ * If the dirent structure has a d_type use it to determine if we are dealing with
+ * a file or directory. Unfortunately if it doesn't have it, or if the type is
+ * unknown, or a link then we'll need to use the stat function instead.
+ */
+#ifdef _DIRENT_HAVE_D_TYPE
+		if (entry->d_type != DT_UNKNOWN && entry->d_type != DT_LNK) {
+			is_file = entry->d_type == DT_REG;
+			is_dir = entry->d_type == DT_DIR;
+		} else
+#endif
+		{
+			struct stat statbuf;
+
+			/*
+			 * Don't use alloca or we risk blowing out the stack if recursing
+			 * into subdirectories.
+			 */
+			full_path = ast_malloc(strlen(path) + strlen(entry->d_name) + 2);
+			if (!full_path) {
+				return -1;
+			}
+			sprintf(full_path, "%s/%s", path, entry->d_name);
+
+			if (stat(full_path, &statbuf)) {
+				ast_log(LOG_ERROR, "Error reading path stats - %s: %s\n",
+					full_path, strerror(errno));
+				/*
+				 * Output an error, but keep going. It could just be
+				 * a broken link and other files could be fine.
+				 */
+				continue;
+			}
+
+			is_file = S_ISREG(statbuf.st_mode);
+			is_dir = S_ISDIR(statbuf.st_mode);
+		}
+
+		if (is_file) {
+			/* If the handler returns non-zero then stop */
+			if ((res = on_file(path, entry->d_name, obj))) {
+				break;
+			}
+			/* Otherwise move on to next item in directory */
+			continue;
+		}
+
+		if (!is_dir) {
+			ast_debug(5, "Skipping %s: not a regular file or directory\n", full_path);
+			continue;
+		}
+
+		/* Only re-curse into sub-directories if not at the max depth */
+		if (max_depth != 0) {
+			if (!full_path) {
+				/* Don't use alloca.  See note above. */
+				full_path = ast_malloc(strlen(path) + strlen(entry->d_name) + 2);
+				if (!full_path) {
+					return -1;
+				}
+				sprintf(full_path, "%s/%s", path, entry->d_name);
+			}
+
+			if ((res = __ast_file_read_dirs(full_path, on_file, obj, max_depth))) {
+				break;
+			}
+		}
+	}
+
+	closedir(dir);
+
+	if (!res && errno) {
+		ast_log(LOG_ERROR, "Error while reading directories - %s: %s\n",
+			path, strerror(errno));
+		res = -1;
+	}
+
+	return res;
+}
+
+#if !defined(__GLIBC__)
+/*!
+ * \brief Lock to hold when iterating over directories.
+ *
+ * Currently, 'readdir' is not required to be thread-safe. In most modern implementations
+ * it should be safe to make concurrent calls into 'readdir' that specify different directory
+ * streams (glibc would be one of these). However, since it is potentially unsafe for some
+ * implementations we'll use our own locking in order to achieve synchronization for those.
+ */
+AST_MUTEX_DEFINE_STATIC(read_dirs_lock);
+#endif
+
+int ast_file_read_dirs(const char *dir_name, ast_file_on_file on_file, void *obj, int max_depth)
+{
+	int res;
+
+	errno = 0;
+
+#if !defined(__GLIBC__)
+	ast_mutex_lock(&read_dirs_lock);
+#endif
+
+	res = __ast_file_read_dirs(dir_name, on_file, obj, max_depth);
+
+#if !defined(__GLIBC__)
+	ast_mutex_unlock(&read_dirs_lock);
+#endif
+
+	return res;
+}
+
 int ast_streamfile(struct ast_channel *chan, const char *filename, const char *preflang)
 {
 	struct ast_filestream *fs;
@@ -1408,7 +1550,7 @@ static int waitstream_core(struct ast_channel *c,
 		reverse = "";
 
 	/* Switch the channel to end DTMF frame only. waitstream_core doesn't care about the start of DTMF. */
-	ast_set_flag(ast_channel_flags(c), AST_FLAG_END_DTMF_ONLY);
+	ast_channel_set_flag(c, AST_FLAG_END_DTMF_ONLY);
 
 	if (ast_test_flag(ast_channel_flags(c), AST_FLAG_MASQ_NOSTREAM))
 		orig_chan_name = ast_strdupa(ast_channel_name(c));
@@ -1440,7 +1582,7 @@ static int waitstream_core(struct ast_channel *c,
 			res = ast_waitfor(c, ms);
 			if (res < 0) {
 				ast_log(LOG_WARNING, "Select failed (%s)\n", strerror(errno));
-				ast_clear_flag(ast_channel_flags(c), AST_FLAG_END_DTMF_ONLY);
+				ast_channel_clear_flag(c, AST_FLAG_END_DTMF_ONLY);
 				return res;
 			}
 		} else {
@@ -1451,11 +1593,11 @@ static int waitstream_core(struct ast_channel *c,
 				if (errno == EINTR)
 					continue;
 				ast_log(LOG_WARNING, "Wait failed (%s)\n", strerror(errno));
-				ast_clear_flag(ast_channel_flags(c), AST_FLAG_END_DTMF_ONLY);
+				ast_channel_clear_flag(c, AST_FLAG_END_DTMF_ONLY);
 				return -1;
 			} else if (outfd > -1) { /* this requires cmdfd set */
 				/* The FD we were watching has something waiting */
-				ast_clear_flag(ast_channel_flags(c), AST_FLAG_END_DTMF_ONLY);
+				ast_channel_clear_flag(c, AST_FLAG_END_DTMF_ONLY);
 				return 1;
 			}
 			/* if rchan is set, it is 'c' */
@@ -1464,7 +1606,7 @@ static int waitstream_core(struct ast_channel *c,
 		if (res > 0) {
 			struct ast_frame *fr = ast_read(c);
 			if (!fr) {
-				ast_clear_flag(ast_channel_flags(c), AST_FLAG_END_DTMF_ONLY);
+				ast_channel_clear_flag(c, AST_FLAG_END_DTMF_ONLY);
 				return -1;
 			}
 			switch (fr->frametype) {
@@ -1475,7 +1617,7 @@ static int waitstream_core(struct ast_channel *c,
 						S_COR(ast_channel_caller(c)->id.number.valid, ast_channel_caller(c)->id.number.str, NULL))) {
 						res = fr->subclass.integer;
 						ast_frfree(fr);
-						ast_clear_flag(ast_channel_flags(c), AST_FLAG_END_DTMF_ONLY);
+						ast_channel_clear_flag(c, AST_FLAG_END_DTMF_ONLY);
 						return res;
 					}
 				} else {
@@ -1491,7 +1633,7 @@ static int waitstream_core(struct ast_channel *c,
 							"Break");
 
 						ast_frfree(fr);
-						ast_clear_flag(ast_channel_flags(c), AST_FLAG_END_DTMF_ONLY);
+						ast_channel_clear_flag(c, AST_FLAG_END_DTMF_ONLY);
 						return res;
 					}
 				}
@@ -1508,7 +1650,7 @@ static int waitstream_core(struct ast_channel *c,
 						"Break");
 					res = fr->subclass.integer;
 					ast_frfree(fr);
-					ast_clear_flag(ast_channel_flags(c), AST_FLAG_END_DTMF_ONLY);
+					ast_channel_clear_flag(c, AST_FLAG_END_DTMF_ONLY);
 					return res;
 				case AST_CONTROL_STREAM_REVERSE:
 					if (!skip_ms) {
@@ -1526,7 +1668,7 @@ static int waitstream_core(struct ast_channel *c,
 				case AST_CONTROL_BUSY:
 				case AST_CONTROL_CONGESTION:
 					ast_frfree(fr);
-					ast_clear_flag(ast_channel_flags(c), AST_FLAG_END_DTMF_ONLY);
+					ast_channel_clear_flag(c, AST_FLAG_END_DTMF_ONLY);
 					return -1;
 				case AST_CONTROL_RINGING:
 				case AST_CONTROL_ANSWER:
@@ -1563,7 +1705,7 @@ static int waitstream_core(struct ast_channel *c,
 		ast_sched_runq(ast_channel_sched(c));
 	}
 
-	ast_clear_flag(ast_channel_flags(c), AST_FLAG_END_DTMF_ONLY);
+	ast_channel_clear_flag(c, AST_FLAG_END_DTMF_ONLY);
 
 	return (err || ast_channel_softhangup_internal_flag(c)) ? -1 : 0;
 }
@@ -1783,6 +1925,27 @@ struct ast_format *ast_get_format_for_file_ext(const char *file_ext)
 	}
 
 	return NULL;
+}
+
+int ast_get_extension_for_mime_type(const char *mime_type, char *buffer, size_t capacity)
+{
+	struct ast_format_def *f;
+	SCOPED_RDLOCK(lock, &formats.lock);
+
+	ast_assert(buffer && capacity);
+
+	AST_RWLIST_TRAVERSE(&formats, f, list) {
+		if (type_in_list(f->mime_types, mime_type, strcasecmp)) {
+			size_t item_len = strcspn(f->exts, "|");
+			size_t bytes_written = snprintf(buffer, capacity, ".%.*s", (int) item_len, f->exts);
+			if (bytes_written < capacity) {
+				/* Only return success if we didn't truncate */
+				return 1;
+			}
+		}
+	}
+
+	return 0;
 }
 
 static struct ast_cli_entry cli_file[] = {

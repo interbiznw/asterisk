@@ -30,8 +30,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/dsp.h"
 #include "asterisk/file.h"
 #include "asterisk/module.h"
@@ -91,9 +89,9 @@ static struct ast_json *recording_to_json(struct stasis_message *message,
 		return NULL;
 	}
 
-	return ast_json_pack("{s: s, s: o}",
+	return ast_json_pack("{s: s, s: O}",
 		"type", type,
-		"recording", ast_json_deep_copy(blob));
+		"recording", blob);
 }
 
 STASIS_MESSAGE_TYPE_DEFN(stasis_app_recording_snapshot_type,
@@ -633,13 +631,14 @@ static int load_module(void)
 
 	r = STASIS_MESSAGE_TYPE_INIT(stasis_app_recording_snapshot_type);
 	if (r != 0) {
-		return AST_MODULE_LOAD_FAILURE;
+		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	recordings = ao2_container_alloc(RECORDING_BUCKETS, recording_hash,
 		recording_cmp);
 	if (!recordings) {
-		return AST_MODULE_LOAD_FAILURE;
+		STASIS_MESSAGE_TYPE_CLEANUP(stasis_app_recording_snapshot_type);
+		return AST_MODULE_LOAD_DECLINE;
 	}
 	return AST_MODULE_LOAD_SUCCESS;
 }
@@ -656,6 +655,6 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_
 	.support_level = AST_MODULE_SUPPORT_CORE,
 	.load = load_module,
 	.unload = unload_module,
-	.nonoptreq = "res_stasis",
+	.requires = "res_stasis",
 	.load_pri = AST_MODPRI_APP_DEPEND
 );

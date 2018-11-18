@@ -39,9 +39,8 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/_private.h"
+#include "features_config.h"
 
 #include <pthread.h>
 #include <signal.h>
@@ -198,7 +197,6 @@ ASTERISK_REGISTER_FILE()
 					<value name="FAILURE" />
 					<value name="LOOP" />
 					<value name="NONEXISTENT" />
-					<value name="INCOMPATIBLE" />
 				</variable>
 			</variablelist>
 		</description>
@@ -784,7 +782,7 @@ static int action_bridge(struct mansession *s, const struct message *m)
 	chana_exten = ast_strdupa(ast_channel_exten(chana));
 	chana_context = ast_strdupa(ast_channel_context(chana));
 	chana_priority = ast_channel_priority(chana);
-	if (!ast_test_flag(ast_channel_flags(chana), AST_FLAG_IN_AUTOLOOP)) {
+	if (ast_test_flag(ast_channel_flags(chana), AST_FLAG_IN_AUTOLOOP)) {
 		chana_priority++;
 	}
 	ast_channel_unlock(chana);
@@ -800,7 +798,7 @@ static int action_bridge(struct mansession *s, const struct message *m)
 	chanb_exten = ast_strdupa(ast_channel_exten(chanb));
 	chanb_context = ast_strdupa(ast_channel_context(chanb));
 	chanb_priority = ast_channel_priority(chanb);
-	if (!ast_test_flag(ast_channel_flags(chanb), AST_FLAG_IN_AUTOLOOP)) {
+	if (ast_test_flag(ast_channel_flags(chanb), AST_FLAG_IN_AUTOLOOP)) {
 		chanb_priority++;
 	}
 	ast_channel_unlock(chanb);
@@ -811,7 +809,7 @@ static int action_bridge(struct mansession *s, const struct message *m)
 		return 0;
 	}
 
-	ast_bridge_set_after_go_on(chana, chana_context, chana_exten, chana_priority, NULL);
+	ast_bridge_set_after_goto(chana, chana_context, chana_exten, chana_priority);
 	if (ast_bridge_add_channel(bridge, chana, NULL, playtone & PLAYTONE_CHANNEL1, xfer_cfg_a ? xfer_cfg_a->xfersound : NULL)) {
 		snprintf(buf, sizeof(buf), "Unable to add Channel1 to bridge: %s", ast_channel_name(chana));
 		astman_send_error(s, m, buf);
@@ -819,7 +817,7 @@ static int action_bridge(struct mansession *s, const struct message *m)
 		return 0;
 	}
 
-	ast_bridge_set_after_go_on(chanb, chanb_context, chanb_exten, chanb_priority, NULL);
+	ast_bridge_set_after_goto(chanb, chanb_context, chanb_exten, chanb_priority);
 	if (ast_bridge_add_channel(bridge, chanb, NULL, playtone & PLAYTONE_CHANNEL2, xfer_cfg_b ? xfer_cfg_b->xfersound : NULL)) {
 		snprintf(buf, sizeof(buf), "Unable to add Channel2 to bridge: %s", ast_channel_name(chanb));
 		astman_send_error(s, m, buf);
@@ -1008,6 +1006,7 @@ static int bridge_exec(struct ast_channel *chan, const char *data)
 	const char *extension;
 	int priority;
 	int bridge_add_failed;
+	int res = -1;
 	struct ast_bridge_features chan_features;
 	struct ast_bridge_features *peer_features;
 	struct ast_bridge *bridge;
@@ -1034,6 +1033,7 @@ static int bridge_exec(struct ast_channel *chan, const char *data)
 	if (!current_dest_chan) {
 		ast_log(LOG_WARNING, "Bridge failed because channel %s does not exist\n",
 			args.dest_chan);
+		pbx_builtin_setvar_helper(chan, "BRIDGERESULT", "NONEXISTENT");
 		return 0;
 	}
 
@@ -1041,13 +1041,13 @@ static int bridge_exec(struct ast_channel *chan, const char *data)
 	if (chan == current_dest_chan) {
 		ast_channel_unref(current_dest_chan);
 		ast_log(LOG_WARNING, "Unable to bridge channel %s with itself\n", ast_channel_name(chan));
+		pbx_builtin_setvar_helper(chan, "BRIDGERESULT", "LOOP");
 		return 0;
 	}
 
 	if (ast_test_flag(&opts, OPT_DURATION_LIMIT)
 		&& !ast_strlen_zero(opt_args[OPT_ARG_DURATION_LIMIT])
 		&& ast_bridge_timelimit(chan, &bconfig, opt_args[OPT_ARG_DURATION_LIMIT], &calldurationlimit)) {
-		pbx_builtin_setvar_helper(chan, "BRIDGERESULT", "FAILURE");
 		goto done;
 	}
 
@@ -1126,14 +1126,18 @@ static int bridge_exec(struct ast_channel *chan, const char *data)
 	/* Don't keep the channel ref in case it was not already in a bridge. */
 	current_dest_chan = ast_channel_unref(current_dest_chan);
 
-	ast_bridge_join(bridge, chan, NULL, &chan_features, NULL,
+	res = ast_bridge_join(bridge, chan, NULL, &chan_features, NULL,
 		AST_BRIDGE_JOIN_PASS_REFERENCE);
 
 	ast_bridge_features_cleanup(&chan_features);
 
-	/* The bridge has ended, set BRIDGERESULT to SUCCESS. */
-	pbx_builtin_setvar_helper(chan, "BRIDGERESULT", "SUCCESS");
 done:
+	if (res == -1) {
+		pbx_builtin_setvar_helper(chan, "BRIDGERESULT", "FAILURE");
+	} else {
+		pbx_builtin_setvar_helper(chan, "BRIDGERESULT", "SUCCESS");
+	}
+
 	ast_free((char *) bconfig.warning_sound);
 	ast_free((char *) bconfig.end_sound);
 	ast_free((char *) bconfig.start_sound);
@@ -1142,36 +1146,33 @@ done:
 	return 0;
 }
 
-/*!
- * \internal
- * \brief Clean up resources on Asterisk shutdown
- */
-static void features_shutdown(void)
+static int unload_module(void)
 {
-	ast_features_config_shutdown();
+	unload_features_config();
 
 	ast_manager_unregister("Bridge");
 
 	ast_unregister_application(app_bridge);
 
+	return 0;
 }
 
-int ast_features_init(void)
+static int load_module(void)
 {
 	int res;
 
-	res = ast_features_config_init();
-	if (res) {
-		return res;
-	}
+	res = load_features_config();
 	res |= ast_register_application2(app_bridge, bridge_exec, NULL, NULL, NULL);
 	res |= ast_manager_register_xml_core("Bridge", EVENT_FLAG_CALL, action_bridge);
 
-	if (res) {
-		features_shutdown();
-	} else {
-		ast_register_cleanup(features_shutdown);
-	}
-
-	return res;
+	return res ? AST_MODULE_LOAD_FAILURE : AST_MODULE_LOAD_SUCCESS;
 }
+
+AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_ORDER, "Call Features",
+	.support_level = AST_MODULE_SUPPORT_CORE,
+	.load = load_module,
+	.unload = unload_module,
+	.reload = reload_features_config,
+	.load_pri = AST_MODPRI_CORE,
+	.requires = "extconfig",
+);

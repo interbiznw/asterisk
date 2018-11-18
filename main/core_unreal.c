@@ -32,8 +32,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/causes.h"
 #include "asterisk/channel.h"
 #include "asterisk/stasis_channels.h"
@@ -323,6 +321,20 @@ int ast_unreal_write(struct ast_channel *ast, struct ast_frame *f)
 
 	if (!p) {
 		return -1;
+	}
+
+	/* If we are told to write a frame with a type that has no corresponding
+	 * stream on the channel then drop it.
+	 */
+	if (f->frametype == AST_FRAME_VOICE) {
+		if (!ast_channel_get_default_stream(ast, AST_MEDIA_TYPE_AUDIO)) {
+			return 0;
+		}
+	} else if (f->frametype == AST_FRAME_VIDEO ||
+		(f->frametype == AST_FRAME_CONTROL && f->subclass.integer == AST_CONTROL_VIDUPDATE)) {
+		if (!ast_channel_get_default_stream(ast, AST_MEDIA_TYPE_VIDEO)) {
+			return 0;
+		}
 	}
 
 	/* Just queue for delivery to the other side */

@@ -31,6 +31,7 @@
 #include <pjsip_simple.h>
 #include <pjlib.h>
 
+#include "asterisk/app.h"
 #include "asterisk/res_pjsip_pubsub.h"
 #include "asterisk/module.h"
 #include "asterisk/linkedlists.h"
@@ -42,6 +43,7 @@
 #include "asterisk/res_pjsip.h"
 #include "asterisk/callerid.h"
 #include "asterisk/manager.h"
+#include "asterisk/cli.h"
 #include "asterisk/test.h"
 #include "res_pjsip/include/res_pjsip_private.h"
 #include "asterisk/res_pjsip_presence_xml.h"
@@ -121,6 +123,14 @@
 				</configOption>
 				<configOption name="expires">
 					<synopsis>The time at which the subscription expires</synopsis>
+				</configOption>
+				<configOption name="contact_uri">
+					<synopsis>The Contact URI of the dialog for the subscription</synopsis>
+				</configOption>
+				<configOption name="prune_on_boot">
+					<synopsis>If set, indicates that the contact used a reliable transport
+					and therefore the subscription must be deleted after an asterisk restart.
+					</synopsis>
 				</configOption>
 			</configObject>
 			<configObject name="resource_list">
@@ -375,6 +385,10 @@ struct subscription_persistence {
 	char *tag;
 	/*! When this subscription expires */
 	struct timeval expires;
+	/*! Contact URI */
+	char contact_uri[PJSIP_MAX_URL_SIZE];
+	/*! Prune subscription on restart */
+	int prune_on_boot;
 };
 
 /*!
@@ -389,6 +403,13 @@ enum sip_subscription_tree_state {
 	SIP_SUB_TREE_TERMINATE_IN_PROGRESS,
 	/*! The terminate process has finished and the subscription tree is no longer valid */
 	SIP_SUB_TREE_TERMINATED,
+};
+
+static char *sub_tree_state_description[] = {
+	"Normal",
+	"TerminatePending",
+	"TerminateInProgress",
+	"Terminated"
 };
 
 /*!
@@ -427,6 +448,15 @@ struct sip_subscription_tree {
 	AST_LIST_ENTRY(sip_subscription_tree) next;
 	/*! Subscription tree state */
 	enum sip_subscription_tree_state state;
+	/*! On asterisk restart, this is the task data used
+	 * to restart the expiration timer if pjproject isn't
+	 * capable of restarting the timer.
+	 */
+	struct ast_sip_sched_task *expiration_task;
+	/*! The transport the subscription was received on.
+	 * Only used for reliable transports.
+	 */
+	pjsip_transport *transport;
 };
 
 /*!
@@ -481,10 +511,23 @@ static const char *sip_subscription_roles_map[] = {
 	[AST_SIP_NOTIFIER] = "Notifier"
 };
 
+enum sip_persistence_update_type {
+	/*! Called from send request */
+	SUBSCRIPTION_PERSISTENCE_SEND_REQUEST = 0,
+	/*! Subscription created from initial client request */
+	SUBSCRIPTION_PERSISTENCE_CREATED,
+	/*! Subscription recreated by asterisk on startup */
+	SUBSCRIPTION_PERSISTENCE_RECREATED,
+	/*! Subscription created from client refresh */
+	SUBSCRIPTION_PERSISTENCE_REFRESHED,
+};
+
 AST_RWLIST_HEAD_STATIC(subscriptions, sip_subscription_tree);
 
 AST_RWLIST_HEAD_STATIC(body_generators, ast_sip_pubsub_body_generator);
 AST_RWLIST_HEAD_STATIC(body_supplements, ast_sip_pubsub_body_supplement);
+
+static pjsip_media_type rlmi_media_type;
 
 static void pubsub_on_evsub_state(pjsip_evsub *sub, pjsip_event *event);
 static void pubsub_on_rx_refresh(pjsip_evsub *sub, pjsip_rx_data *rdata,
@@ -493,7 +536,7 @@ static void pubsub_on_rx_notify(pjsip_evsub *sub, pjsip_rx_data *rdata, int *p_s
 		pj_str_t **p_st_text, pjsip_hdr *res_hdr, pjsip_msg_body **p_body);
 static void pubsub_on_client_refresh(pjsip_evsub *sub);
 static void pubsub_on_server_timeout(pjsip_evsub *sub);
- 
+
 static pjsip_evsub_user pubsub_cb = {
 	.on_evsub_state = pubsub_on_evsub_state,
 	.on_rx_refresh = pubsub_on_rx_refresh,
@@ -515,6 +558,54 @@ static void publication_resource_destroy(void *obj)
 static void *publication_resource_alloc(const char *name)
 {
 	return ast_sorcery_generic_alloc(sizeof(struct ast_sip_publication_resource), publication_resource_destroy);
+}
+
+static int sub_tree_subscription_terminate_cb(void *data)
+{
+	struct sip_subscription_tree *sub_tree = data;
+
+	if (!sub_tree->evsub) {
+		/* Something else already terminated the subscription. */
+		ao2_ref(sub_tree, -1);
+		return 0;
+	}
+
+	ast_debug(3, "Transport destroyed.  Removing subscription '%s->%s'  prune on boot: %d\n",
+		sub_tree->persistence->endpoint, sub_tree->root->resource,
+		sub_tree->persistence->prune_on_boot);
+
+	sub_tree->state = SIP_SUB_TREE_TERMINATE_IN_PROGRESS;
+	pjsip_evsub_terminate(sub_tree->evsub, PJ_TRUE);
+
+	ao2_ref(sub_tree, -1);
+	return 0;
+}
+
+/*!
+ * \internal
+ * \brief The reliable transport we used as a subscription contact has shutdown.
+ *
+ * \param data What subscription needs to be terminated.
+ *
+ * \note Normally executed by the pjsip monitor thread.
+ *
+ * \return Nothing
+ */
+static void sub_tree_transport_cb(void *data)
+{
+	struct sip_subscription_tree *sub_tree = data;
+
+	/*
+	 * Push off the subscription termination to the serializer to
+	 * avoid deadlock.  Another thread could be trying to send a
+	 * message on the subscription that can deadlock with this
+	 * thread.
+	 */
+	ao2_ref(sub_tree, +1);
+	if (ast_sip_push_task(sub_tree->serializer, sub_tree_subscription_terminate_cb,
+		sub_tree)) {
+		ao2_ref(sub_tree, -1);
+	}
 }
 
 /*! \brief Destructor for subscription persistence */
@@ -559,7 +650,7 @@ static struct subscription_persistence *subscription_persistence_create(struct s
 
 /*! \brief Function which updates persistence information of a subscription in sorcery */
 static void subscription_persistence_update(struct sip_subscription_tree *sub_tree,
-	pjsip_rx_data *rdata)
+	pjsip_rx_data *rdata, enum sip_persistence_update_type type)
 {
 	pjsip_dialog *dlg;
 
@@ -567,15 +658,49 @@ static void subscription_persistence_update(struct sip_subscription_tree *sub_tr
 		return;
 	}
 
+	ast_debug(3, "Updating persistence for '%s->%s'  prune on boot: %s\n",
+		sub_tree->persistence->endpoint, sub_tree->root->resource,
+		sub_tree->persistence->prune_on_boot ? "yes" : "no");
+
 	dlg = sub_tree->dlg;
 	sub_tree->persistence->cseq = dlg->local.cseq;
 
 	if (rdata) {
 		int expires;
 		pjsip_expires_hdr *expires_hdr = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_EXPIRES, NULL);
+		pjsip_contact_hdr *contact_hdr = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_CONTACT, NULL);
 
 		expires = expires_hdr ? expires_hdr->ivalue : DEFAULT_PUBLISH_EXPIRES;
 		sub_tree->persistence->expires = ast_tvadd(ast_tvnow(), ast_samp2tv(expires, 1));
+
+		if (contact_hdr) {
+			if (contact_hdr) {
+				if (type == SUBSCRIPTION_PERSISTENCE_CREATED) {
+					sub_tree->persistence->prune_on_boot =
+						!ast_sip_will_uri_survive_restart(
+							(pjsip_sip_uri *)pjsip_uri_get_uri(contact_hdr->uri),
+							sub_tree->endpoint, rdata);
+
+					if (sub_tree->persistence->prune_on_boot) {
+						ast_debug(3, "adding transport monitor on %s for '%s->%s'  prune on boot: %d\n",
+							rdata->tp_info.transport->obj_name,
+							sub_tree->persistence->endpoint, sub_tree->root->resource,
+							sub_tree->persistence->prune_on_boot);
+						sub_tree->transport = rdata->tp_info.transport;
+						ast_sip_transport_monitor_register(rdata->tp_info.transport,
+							sub_tree_transport_cb, sub_tree);
+						/*
+						 * FYI: ast_sip_transport_monitor_register holds a reference to the sub_tree
+						 */
+					}
+				}
+			}
+
+			pjsip_uri_print(PJSIP_URI_IN_CONTACT_HDR, contact_hdr->uri,
+					sub_tree->persistence->contact_uri, sizeof(sub_tree->persistence->contact_uri));
+		} else {
+			ast_log(LOG_WARNING, "Contact not updated due to missing contact header\n");
+		}
 
 		/* When receiving a packet on an streaming transport, it's possible to receive more than one SIP
 		 * message at a time into the rdata->pkt_info.packet buffer. However, the rdata->msg_info.msg_buf
@@ -583,12 +708,15 @@ static void subscription_persistence_update(struct sip_subscription_tree *sub_tr
 		 * persistence that is pulled from persistent storage, though, the rdata->pkt_info.packet will
 		 * only ever have a single SIP message on it, and so we base persistence on that.
 		 */
-		if (rdata->msg_info.msg_buf) {
-			ast_copy_string(sub_tree->persistence->packet, rdata->msg_info.msg_buf,
-					MIN(sizeof(sub_tree->persistence->packet), rdata->msg_info.len));
-		} else {
-			ast_copy_string(sub_tree->persistence->packet, rdata->pkt_info.packet,
-					sizeof(sub_tree->persistence->packet));
+		if (type == SUBSCRIPTION_PERSISTENCE_CREATED
+			|| type == SUBSCRIPTION_PERSISTENCE_RECREATED) {
+			if (rdata->msg_info.msg_buf) {
+				ast_copy_string(sub_tree->persistence->packet, rdata->msg_info.msg_buf,
+						MIN(sizeof(sub_tree->persistence->packet), rdata->msg_info.len));
+			} else {
+				ast_copy_string(sub_tree->persistence->packet, rdata->pkt_info.packet,
+						sizeof(sub_tree->persistence->packet));
+			}
 		}
 		ast_copy_string(sub_tree->persistence->src_name, rdata->pkt_info.src_name,
 				sizeof(sub_tree->persistence->src_name));
@@ -608,6 +736,15 @@ static void subscription_persistence_remove(struct sip_subscription_tree *sub_tr
 {
 	if (!sub_tree->persistence) {
 		return;
+	}
+
+	if (sub_tree->persistence->prune_on_boot && sub_tree->transport) {
+		ast_debug(3, "Unregistering transport monitor on %s '%s->%s'\n",
+			sub_tree->transport->obj_name,
+			sub_tree->endpoint ? ast_sorcery_object_get_id(sub_tree->endpoint) : "Unknown",
+			sub_tree->root ? sub_tree->root->resource : "Unknown");
+		ast_sip_transport_monitor_unregister(sub_tree->transport,
+			sub_tree_transport_cb, sub_tree, NULL);
 	}
 
 	ast_sorcery_delete(ast_sip_get_sorcery(), sub_tree->persistence);
@@ -686,10 +823,11 @@ static struct ast_sip_pubsub_body_generator *subscription_get_generator_from_rda
 	char accept[AST_SIP_MAX_ACCEPT][64];
 	size_t num_accept_headers = 0;
 
-	while ((accept_header = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_ACCEPT, accept_header->next))) {
+	while ((accept_header = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_ACCEPT, accept_header->next)) &&
+		(num_accept_headers < AST_SIP_MAX_ACCEPT)) {
 		int i;
 
-		for (i = 0; i < accept_header->count; ++i) {
+		for (i = 0; i < accept_header->count && num_accept_headers < AST_SIP_MAX_ACCEPT; ++i) {
 			if (!exceptional_accept(&accept_header->values[i])) {
 				ast_copy_pj_str(accept[num_accept_headers], &accept_header->values[i], sizeof(accept[num_accept_headers]));
 				++num_accept_headers;
@@ -853,7 +991,7 @@ static int have_visited(const char *resource, struct resources *visited)
  * This iterates through the items on a resource list and creates tree nodes for each one. The
  * tree nodes created are children of the supplied parent node. If an item in the resource
  * list is itself a list, then this function is called recursively to provide children for
- * the the new node.
+ * the new node.
  *
  * If an item in a resource list is not a list, then the supplied subscription handler is
  * called into as if a new SUBSCRIBE for the list item were presented. The handler's response
@@ -889,13 +1027,16 @@ static void build_node_children(struct ast_sip_endpoint *endpoint, const struct 
 			if (PJSIP_IS_STATUS_IN_CLASS(resp, 200)) {
 				current = tree_node_alloc(resource, visited, 0);
 				if (!current) {
-					ast_debug(1, "Subscription to leaf resource %s was successful, but encountered"
-							"allocation error afterwards\n", resource);
+					ast_debug(1,
+						"Subscription to leaf resource %s was successful, but encountered allocation error afterwards\n",
+						resource);
 					continue;
 				}
 				ast_debug(2, "Subscription to leaf resource %s resulted in success. Adding to parent %s\n",
 						resource, parent->resource);
-				AST_VECTOR_APPEND(&parent->children, current);
+				if (AST_VECTOR_APPEND(&parent->children, current)) {
+					tree_node_destroy(current);
+				}
 			} else {
 				ast_debug(2, "Subscription to leaf resource %s resulted in error response %d\n",
 						resource, resp);
@@ -910,7 +1051,9 @@ static void build_node_children(struct ast_sip_endpoint *endpoint, const struct 
 			build_node_children(endpoint, handler, child_list, current, visited);
 			if (AST_VECTOR_SIZE(&current->children) > 0) {
 				ast_debug(1, "List %s had no successful children.\n", resource);
-				AST_VECTOR_APPEND(&parent->children, current);
+				if (AST_VECTOR_APPEND(&parent->children, current)) {
+					tree_node_destroy(current);
+				}
 			} else {
 				ast_debug(2, "List %s had successful children. Adding to parent %s\n",
 						resource, parent->resource);
@@ -984,7 +1127,8 @@ static int build_resource_tree(struct ast_sip_endpoint *endpoint, const struct a
 	struct resources visited;
 
 	if (!has_eventlist_support || !(list = retrieve_resource_list(resource, handler->event_name))) {
-		ast_debug(2, "Subscription to resource %s is not to a list\n", resource);
+		ast_debug(2, "Subscription '%s->%s' is not to a list\n",
+			ast_sorcery_object_get_id(endpoint), resource);
 		tree->root = tree_node_alloc(resource, NULL, 0);
 		if (!tree->root) {
 			return 500;
@@ -992,7 +1136,8 @@ static int build_resource_tree(struct ast_sip_endpoint *endpoint, const struct a
 		return handler->notifier->new_subscribe(endpoint, resource);
 	}
 
-	ast_debug(2, "Subscription to resource %s is a list\n", resource);
+	ast_debug(2, "Subscription '%s->%s' is a list\n",
+		ast_sorcery_object_get_id(endpoint), resource);
 	if (AST_VECTOR_INIT(&visited, AST_VECTOR_SIZE(&list->items))) {
 		return 500;
 	}
@@ -1017,30 +1162,36 @@ static int build_resource_tree(struct ast_sip_endpoint *endpoint, const struct a
 
 static void add_subscription(struct sip_subscription_tree *obj)
 {
-	SCOPED_LOCK(lock, &subscriptions, AST_RWLIST_WRLOCK, AST_RWLIST_UNLOCK);
+	AST_RWLIST_WRLOCK(&subscriptions);
 	AST_RWLIST_INSERT_TAIL(&subscriptions, obj, next);
+	AST_RWLIST_UNLOCK(&subscriptions);
 }
 
 static void remove_subscription(struct sip_subscription_tree *obj)
 {
 	struct sip_subscription_tree *i;
-	SCOPED_LOCK(lock, &subscriptions, AST_RWLIST_WRLOCK, AST_RWLIST_UNLOCK);
+
+	AST_RWLIST_WRLOCK(&subscriptions);
 	AST_RWLIST_TRAVERSE_SAFE_BEGIN(&subscriptions, i, next) {
 		if (i == obj) {
 			AST_RWLIST_REMOVE_CURRENT(next);
 			if (i->root) {
-				ast_debug(2, "Removing subscription to resource %s from list of subscriptions\n",
-						ast_sip_subscription_get_resource_name(i->root));
+				ast_debug(2, "Removing subscription '%s->%s' from list of subscriptions\n",
+					ast_sorcery_object_get_id(i->endpoint), ast_sip_subscription_get_resource_name(i->root));
 			}
 			break;
 		}
 	}
 	AST_RWLIST_TRAVERSE_SAFE_END;
+	AST_RWLIST_UNLOCK(&subscriptions);
 }
 
 static void destroy_subscription(struct ast_sip_subscription *sub)
 {
-	ast_debug(3, "Destroying SIP subscription to resource %s\n", sub->resource);
+	ast_debug(3, "Destroying SIP subscription from '%s->%s'\n",
+		sub->tree && sub->tree->endpoint ? ast_sorcery_object_get_id(sub->tree->endpoint) : "Unknown",
+		sub->resource);
+
 	ast_free(sub->body_text);
 
 	AST_VECTOR_FREE(&sub->children);
@@ -1143,6 +1294,10 @@ static struct ast_sip_subscription *create_virtual_subscriptions(const struct as
 		if (AST_VECTOR_APPEND(&sub->children, child)) {
 			ast_debug(1, "Child subscription to resource %s could not be appended\n",
 					child_node->resource);
+			destroy_subscription(child);
+			/* Have to release tree here too because a ref was added
+			 * to child that destroy_subscription() doesn't release. */
+			ao2_cleanup(tree);
 		}
 	}
 
@@ -1192,15 +1347,19 @@ static void subscription_tree_destructor(void *obj)
 {
 	struct sip_subscription_tree *sub_tree = obj;
 
-	ast_debug(3, "Destroying subscription tree %p\n", sub_tree);
-
-	ao2_cleanup(sub_tree->endpoint);
+	ast_debug(3, "Destroying subscription tree %p '%s->%s'\n",
+		sub_tree,
+		sub_tree->endpoint ? ast_sorcery_object_get_id(sub_tree->endpoint) : "Unknown",
+		sub_tree->root ? sub_tree->root->resource : "Unknown");
 
 	destroy_subscriptions(sub_tree->root);
 
 	if (sub_tree->dlg) {
-		ast_sip_push_task_synchronous(sub_tree->serializer, subscription_unreference_dialog, sub_tree);
+		ast_sip_push_task_wait_servant(sub_tree->serializer,
+			subscription_unreference_dialog, sub_tree);
 	}
+
+	ao2_cleanup(sub_tree->endpoint);
 
 	ast_taskprocessor_unreference(sub_tree->serializer);
 	ast_module_unref(ast_module_info->self);
@@ -1208,7 +1367,8 @@ static void subscription_tree_destructor(void *obj)
 
 void ast_sip_subscription_destroy(struct ast_sip_subscription *sub)
 {
-	ast_debug(3, "Removing subscription %p reference to subscription tree %p\n", sub, sub->tree);
+	ast_debug(3, "Removing subscription %p '%s->%s' reference to subscription tree %p\n",
+		sub, ast_sorcery_object_get_id(sub->tree->endpoint), sub->resource, sub->tree);
 	ao2_cleanup(sub->tree);
 }
 
@@ -1315,7 +1475,6 @@ static struct sip_subscription_tree *create_subscription_tree(const struct ast_s
 		dlg->local.tag_hval = pj_hash_calc_tolower(0, NULL, &dlg->local.info->tag);
 		pjsip_ua_register_dlg(pjsip_ua_instance(), dlg);
 		dlg->local.cseq = persistence->cseq;
-		dlg->remote.cseq = persistence->cseq;
 	}
 
 	pjsip_evsub_create_uas(dlg, &pubsub_cb, rdata, 0, &sub_tree->evsub);
@@ -1339,6 +1498,12 @@ static struct sip_subscription_tree *create_subscription_tree(const struct ast_s
 
 	return sub_tree;
 }
+
+/*! Wrapper structure for initial_notify_task */
+struct initial_notify_data {
+	struct sip_subscription_tree *sub_tree;
+	int expires;
+};
 
 static int initial_notify_task(void *obj);
 static int send_notify(struct sip_subscription_tree *sub_tree, unsigned int force_full_state);
@@ -1378,6 +1543,12 @@ static int sub_persistence_recreate(void *obj)
 	resource = ast_alloca(resource_size);
 	ast_copy_pj_str(resource, &request_uri->user, resource_size);
 
+	/*
+	 * We may want to match without any user options getting
+	 * in the way.
+	 */
+	AST_SIP_USER_OPTIONS_TRUNCATE_CHECK(resource);
+
 	handler = subscription_get_handler_from_rdata(rdata);
 	if (!handler || !handler->notifier) {
 		ast_log(LOG_WARNING, "Failed recreating '%s' subscription: Could not get subscription handler.\n",
@@ -1404,7 +1575,6 @@ static int sub_persistence_recreate(void *obj)
 		ast_log(LOG_WARNING, "Failed recreating '%s' subscription: The endpoint was not found\n",
 			persistence->endpoint);
 		ast_sorcery_delete(ast_sip_get_sorcery(), persistence);
-		ao2_ref(endpoint, -1);
 		return 0;
 	}
 
@@ -1422,9 +1592,12 @@ static int sub_persistence_recreate(void *obj)
 		}
 		pjsip_msg_add_hdr(rdata->msg_info.msg, (pjsip_hdr *) expires_header);
 	}
+
 	expires_header->ivalue = (ast_tvdiff_ms(persistence->expires, ast_tvnow()) / 1000);
 	if (expires_header->ivalue <= 0) {
 		/* The subscription expired since we started recreating the subscription. */
+		ast_debug(3, "Expired subscription retrived from persistent store '%s' %s\n",
+			persistence->endpoint, persistence->tag);
 		ast_sorcery_delete(ast_sip_get_sorcery(), persistence);
 		ao2_ref(endpoint, -1);
 		return 0;
@@ -1445,18 +1618,30 @@ static int sub_persistence_recreate(void *obj)
 				ast_sorcery_delete(ast_sip_get_sorcery(), persistence);
 			}
 		} else {
+			struct initial_notify_data *ind = ast_malloc(sizeof(*ind));
+
+			if (!ind) {
+				pjsip_evsub_terminate(sub_tree->evsub, PJ_TRUE);
+				goto error;
+			}
+
+			ind->sub_tree = ao2_bump(sub_tree);
+			ind->expires = expires_header->ivalue;
+
 			sub_tree->persistence = ao2_bump(persistence);
-			subscription_persistence_update(sub_tree, rdata);
-			if (ast_sip_push_task(sub_tree->serializer, initial_notify_task,
-				ao2_bump(sub_tree))) {
+			subscription_persistence_update(sub_tree, rdata, SUBSCRIPTION_PERSISTENCE_RECREATED);
+			if (ast_sip_push_task(sub_tree->serializer, initial_notify_task, ind)) {
 				/* Could not send initial subscribe NOTIFY */
 				pjsip_evsub_terminate(sub_tree->evsub, PJ_TRUE);
 				ao2_ref(sub_tree, -1);
+				ast_free(ind);
 			}
 		}
 	} else {
 		ast_sorcery_delete(ast_sip_get_sorcery(), persistence);
 	}
+
+error:
 	resource_tree_destroy(&tree);
 	ao2_ref(endpoint, -1);
 
@@ -1472,8 +1657,18 @@ static int subscription_persistence_recreate(void *obj, void *arg, int flags)
 	pjsip_rx_data rdata;
 	struct persistence_recreate_data recreate_data;
 
+	/* If this subscription used a reliable transport it can't be reestablished so remove it */
+	if (persistence->prune_on_boot) {
+		ast_debug(3, "Deleting subscription marked as 'prune' from persistent store '%s' %s\n",
+			persistence->endpoint, persistence->tag);
+		ast_sorcery_delete(ast_sip_get_sorcery(), persistence);
+		return 0;
+	}
+
 	/* If this subscription has already expired remove it */
 	if (ast_tvdiff_ms(persistence->expires, ast_tvnow()) <= 0) {
+		ast_debug(3, "Expired subscription retrived from persistent store '%s' %s\n",
+			persistence->endpoint, persistence->tag);
 		ast_sorcery_delete(ast_sip_get_sorcery(), persistence);
 		return 0;
 	}
@@ -1482,8 +1677,9 @@ static int subscription_persistence_recreate(void *obj, void *arg, int flags)
 	pj_pool_reset(pool);
 	rdata.tp_info.pool = pool;
 
-	if (ast_sip_create_rdata(&rdata, persistence->packet, persistence->src_name, persistence->src_port,
-		persistence->transport_key, persistence->local_name, persistence->local_port)) {
+	if (ast_sip_create_rdata_with_contact(&rdata, persistence->packet, persistence->src_name,
+		persistence->src_port, persistence->transport_key, persistence->local_name,
+		persistence->local_port, persistence->contact_uri)) {
 		ast_log(LOG_WARNING, "Failed recreating '%s' subscription: The message could not be parsed\n",
 			persistence->endpoint);
 		ast_sorcery_delete(ast_sip_get_sorcery(), persistence);
@@ -1507,7 +1703,8 @@ static int subscription_persistence_recreate(void *obj, void *arg, int flags)
 	}
 	recreate_data.persistence = persistence;
 	recreate_data.rdata = &rdata;
-	if (ast_sip_push_task_synchronous(serializer, sub_persistence_recreate, &recreate_data)) {
+	if (ast_sip_push_task_wait_serializer(serializer, sub_persistence_recreate,
+		&recreate_data)) {
 		ast_log(LOG_WARNING, "Failed recreating '%s' subscription: Could not continue under distributor serializer.\n",
 			persistence->endpoint);
 		ast_sorcery_delete(ast_sip_get_sorcery(), persistence);
@@ -1572,18 +1769,19 @@ static int for_each_subscription(on_subscription_t on_subscription, void *arg)
 {
 	int num = 0;
 	struct sip_subscription_tree *i;
-	SCOPED_LOCK(lock, &subscriptions, AST_RWLIST_RDLOCK, AST_RWLIST_UNLOCK);
 
 	if (!on_subscription) {
 		return num;
 	}
 
+	AST_RWLIST_RDLOCK(&subscriptions);
 	AST_RWLIST_TRAVERSE(&subscriptions, i, next) {
 		if (on_subscription(i, arg)) {
 			break;
 		}
 		++num;
 	}
+	AST_RWLIST_UNLOCK(&subscriptions);
 	return num;
 }
 
@@ -1634,28 +1832,6 @@ void *ast_sip_subscription_get_header(const struct ast_sip_subscription *sub, co
 	return pjsip_msg_find_hdr_by_name(msg, &name, NULL);
 }
 
-/*!
- * \internal
- * \brief Wrapper for pjsip_evsub_send_request
- *
- * This function (re)sets the transport before sending to catch cases
- * where the transport might have changed.
- *
- * If pjproject gives us the ability to resend, we'll only reset the transport
- * if PJSIP_ETPNOTAVAIL is returned from send.
- *
- * \returns pj_status_t
- */
-static pj_status_t internal_pjsip_evsub_send_request(struct sip_subscription_tree *sub_tree, pjsip_tx_data *tdata)
-{
-	pjsip_tpselector selector = { .type = PJSIP_TPSELECTOR_NONE, };
-
-	ast_sip_set_tpselector_from_transport_name(sub_tree->endpoint->transport, &selector);
-	pjsip_dlg_set_transport(sub_tree->dlg, &selector);
-
-	return pjsip_evsub_send_request(sub_tree->evsub, tdata);
-}
-
 /* XXX This function is not used. */
 struct ast_sip_subscription *ast_sip_create_subscription(const struct ast_sip_subscription_handler *handler,
 		struct ast_sip_endpoint *endpoint, const char *resource)
@@ -1703,7 +1879,7 @@ struct ast_sip_subscription *ast_sip_create_subscription(const struct ast_sip_su
 	evsub = sub_tree->evsub;
 
 	if (pjsip_evsub_initiate(evsub, NULL, -1, &tdata) == PJ_SUCCESS) {
-		internal_pjsip_evsub_send_request(sub_tree, tdata);
+		pjsip_evsub_send_request(sub_tree->evsub, tdata);
 	} else {
 		/* pjsip_evsub_terminate will result in pubsub_on_evsub_state,
 		 * being called and terminating the subscription. Therefore, we don't
@@ -1796,12 +1972,13 @@ static int sip_subscription_send_request(struct sip_subscription_tree *sub_tree,
 
 	if (allocate_tdata_buffer(tdata)) {
 		ast_log(LOG_ERROR, "SIP request %s is too large to send.\n", tdata->info);
+		pjsip_tx_data_dec_ref(tdata);
 		return -1;
 	}
 
-	res = internal_pjsip_evsub_send_request(sub_tree, tdata);
+	res = pjsip_evsub_send_request(sub_tree->evsub, tdata);
 
-	subscription_persistence_update(sub_tree, NULL);
+	subscription_persistence_update(sub_tree, NULL, SUBSCRIPTION_PERSISTENCE_SEND_REQUEST);
 
 	ast_test_suite_event_notify("SUBSCRIPTION_STATE_SET",
 		"StateText: %s\r\n"
@@ -1961,8 +2138,6 @@ static void *rlmi_clone_data(pj_pool_t *pool, const void *data, unsigned len)
 static pjsip_multipart_part *build_rlmi_body(pj_pool_t *pool, struct ast_sip_subscription *sub,
 		struct body_part_list *body_parts, unsigned int full_state)
 {
-	static const pj_str_t rlmi_type = { "application", 11 };
-	static const pj_str_t rlmi_subtype = { "rlmi+xml", 8 };
 	pj_xml_node *rlmi;
 	pj_xml_node *name;
 	pjsip_multipart_part *rlmi_part;
@@ -1993,9 +2168,7 @@ static pjsip_multipart_part *build_rlmi_body(pj_pool_t *pool, struct ast_sip_sub
 	rlmi_part = pjsip_multipart_create_part(pool);
 
 	rlmi_part->body = PJ_POOL_ZALLOC_T(pool, pjsip_msg_body);
-	pj_strdup(pool, &rlmi_part->body->content_type.type, &rlmi_type);
-	pj_strdup(pool, &rlmi_part->body->content_type.subtype, &rlmi_subtype);
-	pj_list_init(&rlmi_part->body->content_type.param);
+	pjsip_media_type_cp(pool, &rlmi_part->body->content_type, &rlmi_media_type);
 
 	rlmi_part->body->data = pj_xml_clone(pool, rlmi);
 	rlmi_part->body->clone_data = rlmi_clone_data;
@@ -2080,7 +2253,9 @@ static void build_body_part(pj_pool_t *pool, struct ast_sip_subscription *sub,
 	bp->part->body = body;
 	pj_list_insert_before(&bp->part->hdr, bp->cid);
 
-	AST_VECTOR_APPEND(parts, bp);
+	if (AST_VECTOR_APPEND(parts, bp)) {
+		ast_free(bp);
+	}
 }
 
 /*!
@@ -2141,6 +2316,7 @@ static pjsip_msg_body *generate_list_body(pj_pool_t *pool, struct ast_sip_subscr
 
 	/* This can happen if issuing partial state and no children of the list have changed state */
 	if (AST_VECTOR_SIZE(&body_parts) == 0) {
+		free_body_parts(&body_parts);
 		return NULL;
 	}
 
@@ -2148,6 +2324,7 @@ static pjsip_msg_body *generate_list_body(pj_pool_t *pool, struct ast_sip_subscr
 
 	rlmi_part = build_rlmi_body(pool, sub, &body_parts, use_full_state);
 	if (!rlmi_part) {
+		free_body_parts(&body_parts);
 		return NULL;
 	}
 	pjsip_multipart_add_part(pool, multipart, rlmi_part);
@@ -2382,9 +2559,14 @@ void ast_sip_subscription_get_local_uri(struct ast_sip_subscription *sub, char *
 void ast_sip_subscription_get_remote_uri(struct ast_sip_subscription *sub, char *buf, size_t size)
 {
 	pjsip_dialog *dlg;
+	pjsip_sip_uri *uri;
 
 	dlg = sub->tree->dlg;
-	ast_copy_pj_str(buf, &dlg->remote.info_str, size);
+	uri = pjsip_uri_get_uri(dlg->remote.info->uri);
+
+	if (pjsip_uri_print(PJSIP_URI_IN_FROMTO_HDR, uri, buf, size) < 0) {
+		*buf = '\0';
+	}
 }
 
 const char *ast_sip_subscription_get_resource_name(struct ast_sip_subscription *sub)
@@ -2482,8 +2664,9 @@ static int publication_cmp_fn(void *obj, void *arg, int flags)
 
 static void publish_add_handler(struct ast_sip_publish_handler *handler)
 {
-	SCOPED_LOCK(lock, &publish_handlers, AST_RWLIST_WRLOCK, AST_RWLIST_UNLOCK);
+	AST_RWLIST_WRLOCK(&publish_handlers);
 	AST_RWLIST_INSERT_TAIL(&publish_handlers, handler, next);
+	AST_RWLIST_UNLOCK(&publish_handlers);
 }
 
 int ast_sip_register_publish_handler(struct ast_sip_publish_handler *handler)
@@ -2502,45 +2685,45 @@ int ast_sip_register_publish_handler(struct ast_sip_publish_handler *handler)
 
 	publish_add_handler(handler);
 
-	ast_module_ref(ast_module_info->self);
-
 	return 0;
 }
 
 void ast_sip_unregister_publish_handler(struct ast_sip_publish_handler *handler)
 {
 	struct ast_sip_publish_handler *iter;
-	SCOPED_LOCK(lock, &publish_handlers, AST_RWLIST_WRLOCK, AST_RWLIST_UNLOCK);
+
+	AST_RWLIST_WRLOCK(&publish_handlers);
 	AST_RWLIST_TRAVERSE_SAFE_BEGIN(&publish_handlers, iter, next) {
 		if (handler == iter) {
 			AST_RWLIST_REMOVE_CURRENT(next);
 			ao2_cleanup(handler->publications);
-			ast_module_unref(ast_module_info->self);
 			break;
 		}
 	}
 	AST_RWLIST_TRAVERSE_SAFE_END;
+	AST_RWLIST_UNLOCK(&publish_handlers);
 }
 
 AST_RWLIST_HEAD_STATIC(subscription_handlers, ast_sip_subscription_handler);
 
 static void sub_add_handler(struct ast_sip_subscription_handler *handler)
 {
-	SCOPED_LOCK(lock, &subscription_handlers, AST_RWLIST_WRLOCK, AST_RWLIST_UNLOCK);
+	AST_RWLIST_WRLOCK(&subscription_handlers);
 	AST_RWLIST_INSERT_TAIL(&subscription_handlers, handler, next);
-	ast_module_ref(ast_module_info->self);
+	AST_RWLIST_UNLOCK(&subscription_handlers);
 }
 
 static struct ast_sip_subscription_handler *find_sub_handler_for_event_name(const char *event_name)
 {
 	struct ast_sip_subscription_handler *iter;
-	SCOPED_LOCK(lock, &subscription_handlers, AST_RWLIST_RDLOCK, AST_RWLIST_UNLOCK);
 
+	AST_RWLIST_RDLOCK(&subscription_handlers);
 	AST_RWLIST_TRAVERSE(&subscription_handlers, iter, next) {
 		if (!strcmp(iter->event_name, event_name)) {
 			break;
 		}
 	}
+	AST_RWLIST_UNLOCK(&subscription_handlers);
 	return iter;
 }
 
@@ -2558,8 +2741,9 @@ int ast_sip_register_subscription_handler(struct ast_sip_subscription_handler *h
 
 	existing = find_sub_handler_for_event_name(handler->event_name);
 	if (existing) {
-		ast_log(LOG_ERROR, "Unable to register subscription handler for event %s."
-				"A handler is already registered\n", handler->event_name);
+		ast_log(LOG_ERROR,
+			"Unable to register subscription handler for event %s.  A handler is already registered\n",
+			handler->event_name);
 		return -1;
 	}
 
@@ -2579,15 +2763,16 @@ int ast_sip_register_subscription_handler(struct ast_sip_subscription_handler *h
 void ast_sip_unregister_subscription_handler(struct ast_sip_subscription_handler *handler)
 {
 	struct ast_sip_subscription_handler *iter;
-	SCOPED_LOCK(lock, &subscription_handlers, AST_RWLIST_WRLOCK, AST_RWLIST_UNLOCK);
+
+	AST_RWLIST_WRLOCK(&subscription_handlers);
 	AST_RWLIST_TRAVERSE_SAFE_BEGIN(&subscription_handlers, iter, next) {
 		if (handler == iter) {
 			AST_RWLIST_REMOVE_CURRENT(next);
-			ast_module_unref(ast_module_info->self);
 			break;
 		}
 	}
 	AST_RWLIST_TRAVERSE_SAFE_END;
+	AST_RWLIST_UNLOCK(&subscription_handlers);
 }
 
 static struct ast_sip_pubsub_body_generator *find_body_generator_type_subtype_nolock(const char *type, const char *subtype)
@@ -2692,21 +2877,45 @@ static int generate_initial_notify(struct ast_sip_subscription *sub)
 	return res;
 }
 
+static int pubsub_on_refresh_timeout(void *userdata);
+
 static int initial_notify_task(void * obj)
 {
-	struct sip_subscription_tree *sub_tree;
+	struct initial_notify_data *ind = obj;
 
-	sub_tree = obj;
-	if (generate_initial_notify(sub_tree->root)) {
-		pjsip_evsub_terminate(sub_tree->evsub, PJ_TRUE);
+	if (generate_initial_notify(ind->sub_tree->root)) {
+		pjsip_evsub_terminate(ind->sub_tree->evsub, PJ_TRUE);
 	} else {
-		send_notify(sub_tree, 1);
+		send_notify(ind->sub_tree, 1);
 		ast_test_suite_event_notify("SUBSCRIPTION_ESTABLISHED",
 			"Resource: %s",
-			sub_tree->root->resource);
+			ind->sub_tree->root->resource);
 	}
 
-	ao2_ref(sub_tree, -1);
+	if (ind->expires > -1) {
+		char *name = ast_alloca(strlen("->/ ") +
+			strlen(ind->sub_tree->persistence->endpoint) +
+			strlen(ind->sub_tree->root->resource) +
+			strlen(ind->sub_tree->root->handler->event_name) +
+			ind->sub_tree->dlg->call_id->id.slen + 1);
+
+		sprintf(name, "%s->%s/%s %.*s", ind->sub_tree->persistence->endpoint,
+			ind->sub_tree->root->resource, ind->sub_tree->root->handler->event_name,
+			(int)ind->sub_tree->dlg->call_id->id.slen, ind->sub_tree->dlg->call_id->id.ptr);
+
+		ast_debug(3, "Scheduling timer: %s\n", name);
+		ind->sub_tree->expiration_task = ast_sip_schedule_task(ind->sub_tree->serializer,
+			ind->expires * 1000, pubsub_on_refresh_timeout, name,
+			ind->sub_tree, AST_SIP_SCHED_TASK_FIXED | AST_SIP_SCHED_TASK_DATA_AO2);
+		if (!ind->sub_tree->expiration_task) {
+			ast_log(LOG_ERROR, "Unable to create expiration timer of %d seconds for %s\n",
+				ind->expires, name);
+		}
+	}
+
+	ao2_ref(ind->sub_tree, -1);
+	ast_free(ind);
+
 	return 0;
 }
 
@@ -2750,8 +2959,13 @@ static pj_bool_t pubsub_on_rx_subscribe_request(pjsip_rx_data *rdata)
 	resource = ast_alloca(resource_size);
 	ast_copy_pj_str(resource, &request_uri_sip->user, resource_size);
 
-	expires_header = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_EXPIRES, rdata->msg_info.msg->hdr.next);
+	/*
+	 * We may want to match without any user options getting
+	 * in the way.
+	 */
+	AST_SIP_USER_OPTIONS_TRUNCATE_CHECK(resource);
 
+	expires_header = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_EXPIRES, rdata->msg_info.msg->hdr.next);
 	if (expires_header) {
 		if (expires_header->ivalue == 0) {
 			ast_log(LOG_WARNING, "Subscription request from endpoint %s rejected. Expiration of 0 is invalid\n",
@@ -2794,12 +3008,25 @@ static pj_bool_t pubsub_on_rx_subscribe_request(pjsip_rx_data *rdata)
 			pjsip_endpt_respond_stateless(ast_sip_get_pjsip_endpoint(), rdata, 500, NULL, NULL, NULL);
 		}
 	} else {
+		struct initial_notify_data *ind = ast_malloc(sizeof(*ind));
+
+		if (!ind) {
+			pjsip_evsub_terminate(sub_tree->evsub, PJ_TRUE);
+			resource_tree_destroy(&tree);
+			return PJ_TRUE;
+		}
+
+		ind->sub_tree = ao2_bump(sub_tree);
+		/* Since this is a normal subscribe, pjproject takes care of the timer */
+		ind->expires = -1;
+
 		sub_tree->persistence = subscription_persistence_create(sub_tree);
-		subscription_persistence_update(sub_tree, rdata);
+		subscription_persistence_update(sub_tree, rdata, SUBSCRIPTION_PERSISTENCE_CREATED);
 		sip_subscription_accept(sub_tree, rdata, resp);
-		if (ast_sip_push_task(sub_tree->serializer, initial_notify_task, ao2_bump(sub_tree))) {
+		if (ast_sip_push_task(sub_tree->serializer, initial_notify_task, ind)) {
 			pjsip_evsub_terminate(sub_tree->evsub, PJ_TRUE);
 			ao2_ref(sub_tree, -1);
+			ast_free(ind);
 		}
 	}
 
@@ -2810,8 +3037,8 @@ static pj_bool_t pubsub_on_rx_subscribe_request(pjsip_rx_data *rdata)
 static struct ast_sip_publish_handler *find_pub_handler(const char *event)
 {
 	struct ast_sip_publish_handler *iter = NULL;
-	SCOPED_LOCK(lock, &publish_handlers, AST_RWLIST_RDLOCK, AST_RWLIST_UNLOCK);
 
+	AST_RWLIST_RDLOCK(&publish_handlers);
 	AST_RWLIST_TRAVERSE(&publish_handlers, iter, next) {
 		if (strcmp(event, iter->event_name)) {
 			ast_debug(3, "Event %s does not match %s\n", event, iter->event_name);
@@ -2820,6 +3047,7 @@ static struct ast_sip_publish_handler *find_pub_handler(const char *event)
 		ast_debug(3, "Event name match: %s = %s\n", event, iter->event_name);
 		break;
 	}
+	AST_RWLIST_UNLOCK(&publish_handlers);
 
 	return iter;
 }
@@ -2863,6 +3091,8 @@ static void publication_destroy_fn(void *obj)
 
 	ao2_cleanup(publication->datastores);
 	ao2_cleanup(publication->endpoint);
+
+	ast_module_unref(ast_module_info->self);
 }
 
 static struct ast_sip_publication *sip_create_publication(struct ast_sip_endpoint *endpoint, pjsip_rx_data *rdata,
@@ -2878,6 +3108,8 @@ static struct ast_sip_publication *sip_create_publication(struct ast_sip_endpoin
 	if (!(publication = ao2_alloc(sizeof(*publication) + resource_len + event_configuration_name_len, publication_destroy_fn))) {
 		return NULL;
 	}
+
+	ast_module_ref(ast_module_info->self);
 
 	if (!(publication->datastores = ast_datastores_alloc())) {
 		ao2_ref(publication, -1);
@@ -2900,7 +3132,6 @@ static struct ast_sip_publication *sip_create_publication(struct ast_sip_endpoin
 static int sip_publication_respond(struct ast_sip_publication *pub, int status_code,
 		pjsip_rx_data *rdata)
 {
-	pj_status_t status;
 	pjsip_tx_data *tdata;
 	pjsip_transaction *tsx;
 
@@ -2909,26 +3140,24 @@ static int sip_publication_respond(struct ast_sip_publication *pub, int status_c
 	}
 
 	if (PJSIP_IS_STATUS_IN_CLASS(status_code, 200)) {
-		RAII_VAR(char *, entity_tag, NULL, ast_free_ptr);
-		RAII_VAR(char *, expires, NULL, ast_free_ptr);
+		char buf[30];
 
-		if ((ast_asprintf(&entity_tag, "%d", pub->entity_tag) < 0) ||
-			(ast_asprintf(&expires, "%d", pub->expires) < 0)) {
-			pjsip_tx_data_dec_ref(tdata);
-			return -1;
-		}
+		snprintf(buf, sizeof(buf), "%d", pub->entity_tag);
+		ast_sip_add_header(tdata, "SIP-ETag", buf);
 
-		ast_sip_add_header(tdata, "SIP-ETag", entity_tag);
-		ast_sip_add_header(tdata, "Expires", expires);
+		snprintf(buf, sizeof(buf), "%d", pub->expires);
+		ast_sip_add_header(tdata, "Expires", buf);
 	}
 
-	if ((status = pjsip_tsx_create_uas(&pubsub_module, rdata, &tsx)) != PJ_SUCCESS) {
+	if (pjsip_tsx_create_uas(&pubsub_module, rdata, &tsx) != PJ_SUCCESS) {
+		pjsip_tx_data_dec_ref(tdata);
 		return -1;
 	}
 
 	pjsip_tsx_recv_msg(tsx, rdata);
 
 	if (pjsip_tsx_send_msg(tsx, tdata) != PJ_SUCCESS) {
+		pjsip_tx_data_dec_ref(tdata);
 		return -1;
 	}
 
@@ -2962,6 +3191,12 @@ static struct ast_sip_publication *publish_request_initial(struct ast_sip_endpoi
 	resource_size = pj_strlen(&request_uri_sip->user) + 1;
 	resource_name = ast_alloca(resource_size);
 	ast_copy_pj_str(resource_name, &request_uri_sip->user, resource_size);
+
+	/*
+	 * We may want to match without any user options getting
+	 * in the way.
+	 */
+	AST_SIP_USER_OPTIONS_TRUNCATE_CHECK(resource_name);
 
 	resource = ast_sorcery_retrieve_by_id(ast_sip_get_sorcery(), "inbound-publication", resource_name);
 	if (!resource) {
@@ -3119,7 +3354,7 @@ static pj_bool_t pubsub_on_rx_publish_request(pjsip_rx_data *rdata)
 			ao2_link(handler->publications, publication);
 
 			AST_SCHED_REPLACE_UNREF(publication->sched_id, sched, expires * 1000, publish_expire, publication,
-						ao2_ref(publication, -1), ao2_ref(publication, -1), ao2_ref(publication, +1));
+						ao2_ref(_data, -1), ao2_ref(publication, -1), ao2_ref(publication, +1));
 		} else {
 			AST_SCHED_DEL_UNREF(sched, publication->sched_id, ao2_ref(publication, -1));
 		}
@@ -3185,8 +3420,8 @@ int ast_sip_pubsub_register_body_generator(struct ast_sip_pubsub_body_generator 
 void ast_sip_pubsub_unregister_body_generator(struct ast_sip_pubsub_body_generator *generator)
 {
 	struct ast_sip_pubsub_body_generator *iter;
-	SCOPED_LOCK(lock, &body_generators, AST_RWLIST_WRLOCK, AST_RWLIST_UNLOCK);
 
+	AST_RWLIST_WRLOCK(&body_generators);
 	AST_RWLIST_TRAVERSE_SAFE_BEGIN(&body_generators, iter, list) {
 		if (iter == generator) {
 			AST_LIST_REMOVE_CURRENT(list);
@@ -3194,6 +3429,7 @@ void ast_sip_pubsub_unregister_body_generator(struct ast_sip_pubsub_body_generat
 		}
 	}
 	AST_RWLIST_TRAVERSE_SAFE_END;
+	AST_RWLIST_UNLOCK(&body_generators);
 }
 
 int ast_sip_pubsub_register_body_supplement(struct ast_sip_pubsub_body_supplement *supplement)
@@ -3208,8 +3444,8 @@ int ast_sip_pubsub_register_body_supplement(struct ast_sip_pubsub_body_supplemen
 void ast_sip_pubsub_unregister_body_supplement(struct ast_sip_pubsub_body_supplement *supplement)
 {
 	struct ast_sip_pubsub_body_supplement *iter;
-	SCOPED_LOCK(lock, &body_supplements, AST_RWLIST_WRLOCK, AST_RWLIST_UNLOCK);
 
+	AST_RWLIST_WRLOCK(&body_supplements);
 	AST_RWLIST_TRAVERSE_SAFE_BEGIN(&body_supplements, iter, list) {
 		if (iter == supplement) {
 			AST_LIST_REMOVE_CURRENT(list);
@@ -3217,6 +3453,7 @@ void ast_sip_pubsub_unregister_body_supplement(struct ast_sip_pubsub_body_supple
 		}
 	}
 	AST_RWLIST_TRAVERSE_SAFE_END;
+	AST_RWLIST_UNLOCK(&body_supplements);
 }
 
 const char *ast_sip_subscription_get_body_type(struct ast_sip_subscription *sub)
@@ -3286,12 +3523,145 @@ end:
 	return res;
 }
 
+struct simple_message_summary {
+	int messages_waiting;
+	int voice_messages_new;
+	int voice_messages_old;
+	int voice_messages_urgent_new;
+	int voice_messages_urgent_old;
+	char message_account[PJSIP_MAX_URL_SIZE];
+};
+
+static int parse_simple_message_summary(char *body,
+	struct simple_message_summary *summary)
+{
+	char *line;
+	char *buffer;
+	int found_counts = 0;
+
+	if (ast_strlen_zero(body) || !summary) {
+		return -1;
+	}
+
+	buffer = ast_strdupa(body);
+	memset(summary, 0, sizeof(*summary));
+
+	while ((line = ast_read_line_from_buffer(&buffer))) {
+		line = ast_str_to_lower(line);
+
+		if (sscanf(line, "voice-message: %d/%d (%d/%d)",
+			&summary->voice_messages_new, &summary->voice_messages_old,
+			&summary->voice_messages_urgent_new, &summary->voice_messages_urgent_old)) {
+			found_counts = 1;
+		} else {
+			sscanf(line, "message-account: %s", summary->message_account);
+		}
+	}
+
+	return !found_counts;
+}
+
+static pj_bool_t pubsub_on_rx_mwi_notify_request(pjsip_rx_data *rdata)
+{
+	RAII_VAR(struct ast_sip_endpoint *, endpoint, NULL, ao2_cleanup);
+	struct simple_message_summary summary;
+	const char *endpoint_name;
+	char *atsign;
+	char *context;
+	char *body;
+	char *mailbox;
+	int rc;
+
+	endpoint = ast_pjsip_rdata_get_endpoint(rdata);
+	if (!endpoint) {
+		ast_debug(1, "Incoming MWI: Endpoint not found in rdata (%p)\n", rdata);
+		rc = 404;
+		goto error;
+	}
+
+	endpoint_name = ast_sorcery_object_get_id(endpoint);
+	ast_debug(1, "Incoming MWI: Found endpoint: %s\n", endpoint_name);
+	if (ast_strlen_zero(endpoint->incoming_mwi_mailbox)) {
+		ast_debug(1, "Incoming MWI: No incoming mailbox specified for endpoint '%s'\n", endpoint_name);
+		ast_test_suite_event_notify("PUBSUB_NO_INCOMING_MWI_MAILBOX",
+			"Endpoint: %s", endpoint_name);
+		rc = 404;
+		goto error;
+	}
+
+	mailbox = ast_strdupa(endpoint->incoming_mwi_mailbox);
+	atsign = strchr(mailbox, '@');
+	if (!atsign) {
+		ast_debug(1, "Incoming MWI: No '@' found in endpoint %s's incoming mailbox '%s'.  Can't parse context\n",
+			endpoint_name, endpoint->incoming_mwi_mailbox);
+		rc = 404;
+		goto error;
+	}
+
+	*atsign = '\0';
+	context = atsign + 1;
+
+	body = ast_alloca(rdata->msg_info.msg->body->len + 1);
+	rdata->msg_info.msg->body->print_body(rdata->msg_info.msg->body, body,
+		rdata->msg_info.msg->body->len + 1);
+
+	if (parse_simple_message_summary(body, &summary) != 0) {
+		ast_debug(1, "Incoming MWI: Endpoint: '%s' There was an issue getting message info from body '%s'\n",
+			ast_sorcery_object_get_id(endpoint), body);
+		rc = 404;
+		goto error;
+	}
+
+	if (ast_publish_mwi_state(mailbox, context,
+		summary.voice_messages_new, summary.voice_messages_old)) {
+		ast_log(LOG_ERROR, "Incoming MWI: Endpoint: '%s' Could not publish MWI to stasis.  "
+			"Mailbox: %s Message-Account: %s Voice-Messages: %d/%d (%d/%d)\n",
+			endpoint_name, endpoint->incoming_mwi_mailbox, summary.message_account,
+			summary.voice_messages_new, summary.voice_messages_old,
+			summary.voice_messages_urgent_new, summary.voice_messages_urgent_old);
+		rc = 404;
+	} else {
+		ast_debug(1, "Incoming MWI: Endpoint: '%s' Mailbox: %s Message-Account: %s Voice-Messages: %d/%d (%d/%d)\n",
+			endpoint_name, endpoint->incoming_mwi_mailbox, summary.message_account,
+			summary.voice_messages_new, summary.voice_messages_old,
+			summary.voice_messages_urgent_new, summary.voice_messages_urgent_old);
+		ast_test_suite_event_notify("PUBSUB_INCOMING_MWI_PUBLISH",
+			"Endpoint: %s\r\n"
+			"Mailbox: %s\r\n"
+			"MessageAccount: %s\r\n"
+			"VoiceMessagesNew: %d\r\n"
+			"VoiceMessagesOld: %d\r\n"
+			"VoiceMessagesUrgentNew: %d\r\n"
+			"VoiceMessagesUrgentOld: %d",
+				endpoint_name, endpoint->incoming_mwi_mailbox, summary.message_account,
+				summary.voice_messages_new, summary.voice_messages_old,
+				summary.voice_messages_urgent_new, summary.voice_messages_urgent_old);
+		rc = 200;
+	}
+
+error:
+	pjsip_endpt_respond_stateless(ast_sip_get_pjsip_endpoint(), rdata, rc, NULL, NULL, NULL);
+	return PJ_TRUE;
+}
+
+static pj_bool_t pubsub_on_rx_notify_request(pjsip_rx_data *rdata)
+{
+	if (rdata->msg_info.msg->body &&
+		ast_sip_is_content_type(&rdata->msg_info.msg->body->content_type,
+								"application", "simple-message-summary")) {
+		return pubsub_on_rx_mwi_notify_request(rdata);
+	}
+	return PJ_FALSE;
+}
+
 static pj_bool_t pubsub_on_rx_request(pjsip_rx_data *rdata)
 {
 	if (!pjsip_method_cmp(&rdata->msg_info.msg->line.req.method, pjsip_get_subscribe_method())) {
 		return pubsub_on_rx_subscribe_request(rdata);
 	} else if (!pjsip_method_cmp(&rdata->msg_info.msg->line.req.method, &pjsip_publish_method)) {
 		return pubsub_on_rx_publish_request(rdata);
+	} else if (!pjsip_method_cmp(&rdata->msg_info.msg->line.req.method, &pjsip_notify_method)) {
+		return pubsub_on_rx_notify_request(rdata);
 	}
 
 	return PJ_FALSE;
@@ -3328,7 +3698,7 @@ static void set_state_terminated(struct ast_sip_subscription *sub)
  *           send_notify ultimately calls pjsip_evsub_send_request
  *               pjsip_evsub_send_request calls evsub's set_state
  *                   set_state calls pubsub_evsub_set_state
- *                       pubsub_evsub_set_state checks state == TERMINATE_IN_PROGRESS
+ *                       pubsub_on_evsub_state checks state == TERMINATE_IN_PROGRESS
  *                       removes the subscriptions
  *                       cleans up references to evsub
  *                       sets state = TERMINATED
@@ -3346,6 +3716,15 @@ static void set_state_terminated(struct ast_sip_subscription *sub)
  *     serialized_pubsub_on_refresh_timeout starts
  *         See (1) Above
  *
+ * * Transmission failure sending NOTIFY or error response from client
+ *     pjproject transaction timer expires or non OK response
+ *         pjproject locks dialog
+ *         calls pubsub_on_evsub_state with event TSX_STATE
+ *             pubsub_on_evsub_state checks event == TSX_STATE
+ *             removes the subscriptions
+ *             cleans up references to evsub
+ *             sets state = TERMINATED
+ *         pjproject unlocks dialog
  *
  * * ast_sip_subscription_notify is called
  *       checks state == NORMAL
@@ -3371,23 +3750,39 @@ static void set_state_terminated(struct ast_sip_subscription *sub)
  *
  * Although this function is called for every state change, we only care
  * about the TERMINATED state, and only when we're actually processing the final
- * notify (SIP_SUB_TREE_TERMINATE_IN_PROGRESS).  In this case, we do all
- * the subscription tree cleanup tasks and decrement the evsub reference.
+ * notify (SIP_SUB_TREE_TERMINATE_IN_PROGRESS) OR when a transmission failure
+ * occurs (PJSIP_EVENT_TSX_STATE).  In this case, we do all the subscription tree
+ * cleanup tasks and decrement the evsub reference.
  */
 static void pubsub_on_evsub_state(pjsip_evsub *evsub, pjsip_event *event)
 {
-	struct sip_subscription_tree *sub_tree;
+	struct sip_subscription_tree *sub_tree =
+		pjsip_evsub_get_mod_data(evsub, pubsub_module.id);
 
-	ast_debug(3, "on_evsub_state called with state %s\n", pjsip_evsub_get_state_name(evsub));
+	ast_debug(3, "evsub %p state %s event %s sub_tree %p sub_tree state %s\n", evsub,
+		pjsip_evsub_get_state_name(evsub), pjsip_event_str(event->type), sub_tree,
+		(sub_tree ? sub_tree_state_description[sub_tree->state] : "UNKNOWN"));
 
-	if (pjsip_evsub_get_state(evsub) != PJSIP_EVSUB_STATE_TERMINATED) {
+	if (!sub_tree || pjsip_evsub_get_state(evsub) != PJSIP_EVSUB_STATE_TERMINATED) {
 		return;
 	}
 
-	sub_tree = pjsip_evsub_get_mod_data(evsub, pubsub_module.id);
-	if (!sub_tree || sub_tree->state != SIP_SUB_TREE_TERMINATE_IN_PROGRESS) {
-		ast_debug(1, "Possible terminate race prevented %p\n", sub_tree);
+	/* It's easier to write this as what we WANT to process, then negate it. */
+	if (!(sub_tree->state == SIP_SUB_TREE_TERMINATE_IN_PROGRESS
+		|| (event->type == PJSIP_EVENT_TSX_STATE && sub_tree->state == SIP_SUB_TREE_NORMAL)
+		)) {
+		ast_debug(3, "Do nothing.\n");
 		return;
+	}
+
+	if (sub_tree->expiration_task) {
+		char task_name[256];
+
+		ast_sip_sched_task_get_name(sub_tree->expiration_task, task_name, sizeof(task_name));
+		ast_debug(3, "Cancelling timer: %s\n", task_name);
+		ast_sip_sched_task_cancel(sub_tree->expiration_task);
+		ao2_cleanup(sub_tree->expiration_task);
+		sub_tree->expiration_task = NULL;
 	}
 
 	remove_subscription(sub_tree);
@@ -3411,16 +3806,17 @@ static void pubsub_on_evsub_state(pjsip_evsub *evsub, pjsip_event *event)
 	ao2_ref(sub_tree, -1);
 }
 
-static int serialized_pubsub_on_refresh_timeout(void *userdata)
+static int pubsub_on_refresh_timeout(void *userdata)
 {
 	struct sip_subscription_tree *sub_tree = userdata;
 	pjsip_dialog *dlg = sub_tree->dlg;
 
+	ast_debug(3, "sub_tree %p sub_tree state %s\n", sub_tree,
+		(sub_tree ? sub_tree_state_description[sub_tree->state] : "UNKNOWN"));
+
 	pjsip_dlg_inc_lock(dlg);
 	if (sub_tree->state >= SIP_SUB_TREE_TERMINATE_IN_PROGRESS) {
-		ast_debug(1, "Possible terminate race prevented %p %d\n", sub_tree->evsub, sub_tree->state);
 		pjsip_dlg_dec_lock(dlg);
-		ao2_cleanup(sub_tree);
 		return 0;
 	}
 
@@ -3436,7 +3832,20 @@ static int serialized_pubsub_on_refresh_timeout(void *userdata)
 				"Resource: %s", sub_tree->root->resource);
 
 	pjsip_dlg_dec_lock(dlg);
+
+	return 0;
+}
+
+static int serialized_pubsub_on_refresh_timeout(void *userdata)
+{
+	struct sip_subscription_tree *sub_tree = userdata;
+
+	ast_debug(3, "sub_tree %p sub_tree state %s\n", sub_tree,
+		(sub_tree ? sub_tree_state_description[sub_tree->state] : "UNKNOWN"));
+
+	pubsub_on_refresh_timeout(userdata);
 	ao2_cleanup(sub_tree);
+
 	return 0;
 }
 
@@ -3455,9 +3864,21 @@ static void pubsub_on_rx_refresh(pjsip_evsub *evsub, pjsip_rx_data *rdata,
 	struct sip_subscription_tree *sub_tree;
 
 	sub_tree = pjsip_evsub_get_mod_data(evsub, pubsub_module.id);
+	ast_debug(3, "evsub %p sub_tree %p sub_tree state %s\n", evsub, sub_tree,
+		(sub_tree ? sub_tree_state_description[sub_tree->state] : "UNKNOWN"));
+
 	if (!sub_tree || sub_tree->state != SIP_SUB_TREE_NORMAL) {
-		ast_debug(1, "Possible terminate race prevented %p %d\n", sub_tree, sub_tree ? sub_tree->state : -1 );
 		return;
+	}
+
+	if (sub_tree->expiration_task) {
+		char task_name[256];
+
+		ast_sip_sched_task_get_name(sub_tree->expiration_task, task_name, sizeof(task_name));
+		ast_debug(3, "Cancelling timer: %s\n", task_name);
+		ast_sip_sched_task_cancel(sub_tree->expiration_task);
+		ao2_cleanup(sub_tree->expiration_task);
+		sub_tree->expiration_task = NULL;
 	}
 
 	/* PJSIP will set the evsub's state to terminated before calling into this function
@@ -3467,6 +3888,8 @@ static void pubsub_on_rx_refresh(pjsip_evsub *evsub, pjsip_rx_data *rdata,
 	if (pjsip_evsub_get_state(sub_tree->evsub) == PJSIP_EVSUB_STATE_TERMINATED) {
 		sub_tree->state = SIP_SUB_TREE_TERMINATE_PENDING;
 	}
+
+	subscription_persistence_update(sub_tree, rdata, SUBSCRIPTION_PERSISTENCE_REFRESHED);
 
 	if (ast_sip_push_task(sub_tree->serializer, serialized_pubsub_on_refresh_timeout, ao2_bump(sub_tree))) {
 		/* If we can't push the NOTIFY refreshing task...we'll just go with it. */
@@ -3545,7 +3968,6 @@ static void pubsub_on_server_timeout(pjsip_evsub *evsub)
 
 	sub_tree = pjsip_evsub_get_mod_data(evsub, pubsub_module.id);
 	if (!sub_tree || sub_tree->state != SIP_SUB_TREE_NORMAL) {
-		ast_debug(1, "Possible terminate race prevented %p %d\n", sub_tree, sub_tree ? sub_tree->state : -1 );
         return;
 	}
 
@@ -3570,6 +3992,8 @@ static int ami_subscription_detail(struct sip_subscription_tree *sub_tree,
 	sip_subscription_to_ami(sub_tree, &buf);
 	astman_append(ami->s, "%s\r\n", ast_str_buffer(buf));
 	ast_free(buf);
+
+	++ami->count;
 	return 0;
 }
 
@@ -3588,14 +4012,13 @@ static int ami_subscription_detail_outbound(struct sip_subscription_tree *sub_tr
 static int ami_show_subscriptions_inbound(struct mansession *s, const struct message *m)
 {
 	struct ast_sip_ami ami = { .s = s, .m = m, .action_id = astman_get_header(m, "ActionID"), };
-	int num;
 
 	astman_send_listack(s, m, "Following are Events for each inbound Subscription",
 		"start");
 
-	num = for_each_subscription(ami_subscription_detail_inbound, &ami);
+	for_each_subscription(ami_subscription_detail_inbound, &ami);
 
-	astman_send_list_complete_start(s, m, "InboundSubscriptionDetailComplete", num);
+	astman_send_list_complete_start(s, m, "InboundSubscriptionDetailComplete", ami.count);
 	astman_send_list_complete_end(s);
 	return 0;
 }
@@ -3603,14 +4026,13 @@ static int ami_show_subscriptions_inbound(struct mansession *s, const struct mes
 static int ami_show_subscriptions_outbound(struct mansession *s, const struct message *m)
 {
 	struct ast_sip_ami ami = { .s = s, .m = m, .action_id = astman_get_header(m, "ActionID"), };
-	int num;
 
 	astman_send_listack(s, m, "Following are Events for each outbound Subscription",
 		"start");
 
-	num = for_each_subscription(ami_subscription_detail_outbound, &ami);
+	for_each_subscription(ami_subscription_detail_outbound, &ami);
 
-	astman_send_list_complete_start(s, m, "OutboundSubscriptionDetailComplete", num);
+	astman_send_list_complete_start(s, m, "OutboundSubscriptionDetailComplete", ami.count);
 	astman_send_list_complete_end(s);
 	return 0;
 }
@@ -3631,21 +4053,21 @@ static int format_ami_resource_lists(void *obj, void *arg, int flags)
 		return CMP_STOP;
 	}
 	astman_append(ami->s, "%s\r\n", ast_str_buffer(buf));
-
 	ast_free(buf);
+
+	++ami->count;
 	return 0;
 }
 
 static int ami_show_resource_lists(struct mansession *s, const struct message *m)
 {
 	struct ast_sip_ami ami = { .s = s, .m = m, .action_id = astman_get_header(m, "ActionID"), };
-	int num;
 	struct ao2_container *lists;
 
 	lists = ast_sorcery_retrieve_by_fields(ast_sip_get_sorcery(), "resource_list",
 			AST_RETRIEVE_FLAG_MULTIPLE | AST_RETRIEVE_FLAG_ALL, NULL);
 
-	if (!lists || !(num = ao2_container_count(lists))) {
+	if (!lists || !ao2_container_count(lists)) {
 		astman_send_error(s, m, "No resource lists found\n");
 		return 0;
 	}
@@ -3655,13 +4077,548 @@ static int ami_show_resource_lists(struct mansession *s, const struct message *m
 
 	ao2_callback(lists, OBJ_NODATA, format_ami_resource_lists, &ami);
 
-	astman_send_list_complete_start(s, m, "ResourceListDetailComplete", num);
+	astman_send_list_complete_start(s, m, "ResourceListDetailComplete", ami.count);
 	astman_send_list_complete_end(s);
 	return 0;
 }
 
 #define AMI_SHOW_SUBSCRIPTIONS_INBOUND "PJSIPShowSubscriptionsInbound"
 #define AMI_SHOW_SUBSCRIPTIONS_OUTBOUND "PJSIPShowSubscriptionsOutbound"
+
+#define MAX_REGEX_ERROR_LEN 128
+
+struct cli_sub_parms {
+	/*! CLI handler entry e parameter */
+	struct ast_cli_entry *e;
+	/*! CLI handler entry a parameter */
+	struct ast_cli_args *a;
+	/*! CLI subscription entry output line(s) */
+	struct ast_str *buf;
+	/*! Compiled regular expression to select if buf is written to CLI when not NULL. */
+	regex_t *like;
+	int count;
+};
+
+struct cli_sub_complete_parms {
+	struct ast_cli_args *a;
+	/*! Found callid for search position */
+	char *callid;
+	int wordlen;
+	int which;
+};
+
+static int cli_complete_subscription_common(struct sip_subscription_tree *sub_tree, struct cli_sub_complete_parms *cli)
+{
+	pj_str_t *callid;
+
+	if (!sub_tree->dlg) {
+		return 0;
+	}
+
+	callid = &sub_tree->dlg->call_id->id;
+	if (cli->wordlen <= pj_strlen(callid)
+		&& !strncasecmp(cli->a->word, pj_strbuf(callid), cli->wordlen)
+		&& (++cli->which > cli->a->n)) {
+		cli->callid = ast_malloc(pj_strlen(callid) + 1);
+		if (cli->callid) {
+			ast_copy_pj_str(cli->callid, callid, pj_strlen(callid) + 1);
+		}
+		return -1;
+	}
+	return 0;
+}
+
+static int cli_complete_subscription_inbound(struct sip_subscription_tree *sub_tree, void *arg)
+{
+	return sub_tree->role == AST_SIP_NOTIFIER
+		? cli_complete_subscription_common(sub_tree, arg) : 0;
+}
+
+static int cli_complete_subscription_outbound(struct sip_subscription_tree *sub_tree, void *arg)
+{
+	return sub_tree->role == AST_SIP_SUBSCRIBER
+		? cli_complete_subscription_common(sub_tree, arg) : 0;
+}
+
+static char *cli_complete_subscription_callid(struct ast_cli_args *a)
+{
+	struct cli_sub_complete_parms cli;
+	on_subscription_t on_subscription;
+
+	if (a->pos != 4) {
+		return NULL;
+	}
+
+	if (!strcasecmp(a->argv[3], "inbound")) {
+		on_subscription = cli_complete_subscription_inbound;
+	} else if (!strcasecmp(a->argv[3], "outbound")) {
+		on_subscription = cli_complete_subscription_outbound;
+	} else {
+		/* Should never get here */
+		ast_assert(0);
+		return NULL;
+	}
+
+	cli.a = a;
+	cli.callid = NULL;
+	cli.wordlen = strlen(a->word);
+	cli.which = 0;
+	for_each_subscription(on_subscription, &cli);
+
+	return cli.callid;
+}
+
+static int cli_subscription_expiry(struct sip_subscription_tree *sub_tree)
+{
+	int expiry;
+
+	expiry = sub_tree->persistence
+		? ast_tvdiff_ms(sub_tree->persistence->expires, ast_tvnow()) / 1000
+		: 0;
+	if (expiry < 0) {
+		/* Subscription expired */
+		expiry = 0;
+	}
+	return expiry;
+}
+
+static int cli_show_subscription_common(struct sip_subscription_tree *sub_tree, struct cli_sub_parms *cli)
+{
+	const char *callid = (const char *) cli->buf;/* Member repurposed to pass in callid */
+	pj_str_t *sub_callid;
+	struct ast_str *buf;
+	char *src;
+	char *dest;
+	char *key;
+	char *value;
+	char *value_end;
+	int key_len;
+	int key_filler_width;
+	int value_len;
+
+	if (!sub_tree->dlg) {
+		return 0;
+	}
+	sub_callid = &sub_tree->dlg->call_id->id;
+	if (pj_strcmp2(sub_callid, callid)) {
+		return 0;
+	}
+
+	buf = ast_str_create(512);
+	if (!buf) {
+		return -1;
+	}
+
+	ast_cli(cli->a->fd,
+		"%-20s: %s\n"
+		"===========================================================================\n",
+		"ParameterName", "ParameterValue");
+
+	ast_str_append(&buf, 0, "Resource: %s\n", sub_tree->root->resource);
+	ast_str_append(&buf, 0, "Event: %s\n", sub_tree->root->handler->event_name);
+	ast_str_append(&buf, 0, "Expiry: %d\n", cli_subscription_expiry(sub_tree));
+
+	sip_subscription_to_ami(sub_tree, &buf);
+
+	/* Convert AMI \r\n to \n line terminators. */
+	src = strchr(ast_str_buffer(buf), '\r');
+	if (src) {
+		dest = src;
+		++src;
+		while (*src) {
+			if (*src == '\r') {
+				++src;
+				continue;
+			}
+			*dest++ = *src++;
+		}
+		*dest = '\0';
+		ast_str_update(buf);
+	}
+
+	/* Reformat AMI key value pairs to pretty columns */
+	key = ast_str_buffer(buf);
+	do {
+		value = strchr(key, ':');
+		if (!value) {
+			break;
+		}
+		value_end = strchr(value, '\n');
+		if (!value_end) {
+			break;
+		}
+
+		/* Calculate field lengths */
+		key_len = value - key;
+		key_filler_width = 20 - key_len;
+		if (key_filler_width < 0) {
+			key_filler_width = 0;
+		}
+		value_len = value_end - value;
+
+		ast_cli(cli->a->fd, "%.*s%*s%.*s\n",
+			key_len, key, key_filler_width, "",
+			value_len, value);
+
+		key = value_end + 1;
+	} while (*key);
+	ast_cli(cli->a->fd, "\n");
+
+	ast_free(buf);
+
+	return -1;
+}
+
+static int cli_show_subscription_inbound(struct sip_subscription_tree *sub_tree, void *arg)
+{
+	return sub_tree->role == AST_SIP_NOTIFIER
+		? cli_show_subscription_common(sub_tree, arg) : 0;
+}
+
+static int cli_show_subscription_outbound(struct sip_subscription_tree *sub_tree, void *arg)
+{
+	return sub_tree->role == AST_SIP_SUBSCRIBER
+		? cli_show_subscription_common(sub_tree, arg) : 0;
+}
+
+static char *cli_show_subscription_inout(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	on_subscription_t on_subscription;
+	struct cli_sub_parms cli;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "pjsip show subscription {inbound|outbound}";
+		e->usage = "Usage:\n"
+				   "   pjsip show subscription inbound <call-id>\n"
+				   "   pjsip show subscription outbound <call-id>\n"
+				   "      Show active subscription with the dialog call-id\n";
+		return NULL;
+	case CLI_GENERATE:
+		return cli_complete_subscription_callid(a);
+	}
+
+	if (a->argc != 5) {
+		return CLI_SHOWUSAGE;
+	}
+
+	if (!strcasecmp(a->argv[3], "inbound")) {
+		on_subscription = cli_show_subscription_inbound;
+	} else if (!strcasecmp(a->argv[3], "outbound")) {
+		on_subscription = cli_show_subscription_outbound;
+	} else {
+		/* Should never get here */
+		ast_assert(0);
+		return NULL;
+	}
+
+	/* Find the subscription with the specified call-id */
+	cli.a = a;
+	cli.e = e;
+	cli.buf = (void *) a->argv[4];/* Repurpose the buf member to pass in callid */
+	for_each_subscription(on_subscription, &cli);
+
+	return CLI_SUCCESS;
+}
+
+#define CLI_SHOW_SUB_FORMAT_HEADER \
+	"Endpoint: <Endpoint/Caller-ID.............................................>\n" \
+	"Resource: <Resource/Event.................................................>\n" \
+	"  Expiry: <Expiry>  <Call-id..............................................>\n" \
+	"===========================================================================\n\n"
+#define CLI_SHOW_SUB_FORMAT_ENTRY  \
+	"Endpoint: %s/%s\n" \
+	"Resource: %s/%s\n" \
+	"  Expiry: %8d  %s\n\n"
+
+static int cli_show_subscriptions_detail(struct sip_subscription_tree *sub_tree, struct cli_sub_parms *cli)
+{
+	char caller_id[256];
+	char callid[256];
+
+	ast_callerid_merge(caller_id, sizeof(caller_id),
+		S_COR(sub_tree->endpoint->id.self.name.valid,
+			sub_tree->endpoint->id.self.name.str, NULL),
+		S_COR(sub_tree->endpoint->id.self.number.valid,
+			sub_tree->endpoint->id.self.number.str, NULL),
+		"<none>");
+
+	/* Call-id */
+	if (sub_tree->dlg) {
+		ast_copy_pj_str(callid, &sub_tree->dlg->call_id->id, sizeof(callid));
+	} else {
+		ast_copy_string(callid, "<unknown>", sizeof(callid));
+	}
+
+	ast_str_set(&cli->buf, 0, CLI_SHOW_SUB_FORMAT_ENTRY,
+		ast_sorcery_object_get_id(sub_tree->endpoint), caller_id,
+		sub_tree->root->resource, sub_tree->root->handler->event_name,
+		cli_subscription_expiry(sub_tree), callid);
+
+	if (cli->like) {
+		if (regexec(cli->like, ast_str_buffer(cli->buf), 0, NULL, 0)) {
+			/* Output line did not match the regex */
+			return 0;
+		}
+	}
+
+	ast_cli(cli->a->fd, "%s", ast_str_buffer(cli->buf));
+	++cli->count;
+
+	return 0;
+}
+
+static int cli_show_subscriptions_inbound(struct sip_subscription_tree *sub_tree, void *arg)
+{
+	return sub_tree->role == AST_SIP_NOTIFIER
+		? cli_show_subscriptions_detail(sub_tree, arg) : 0;
+}
+
+static int cli_show_subscriptions_outbound(struct sip_subscription_tree *sub_tree, void *arg)
+{
+	return sub_tree->role == AST_SIP_SUBSCRIBER
+		? cli_show_subscriptions_detail(sub_tree, arg) : 0;
+}
+
+static char *cli_show_subscriptions_inout(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	on_subscription_t on_subscription;
+	struct cli_sub_parms cli;
+	regex_t like;
+	const char *regex;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "pjsip show subscriptions {inbound|outbound} [like]";
+		e->usage = "Usage:\n"
+				   "   pjsip show subscriptions inbound [like <regex>]\n"
+				   "      Show active inbound subscriptions\n"
+				   "   pjsip show subscriptions outbound [like <regex>]\n"
+				   "      Show active outbound subscriptions\n"
+				   "\n"
+				   "   The regex selects a subscriptions output that matches.\n"
+				   "   i.e.,  All output lines for a subscription are checked\n"
+				   "   as a block by the regex.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc != 4 && a->argc != 6) {
+		return CLI_SHOWUSAGE;
+	}
+	if (!strcasecmp(a->argv[3], "inbound")) {
+		on_subscription = cli_show_subscriptions_inbound;
+	} else if (!strcasecmp(a->argv[3], "outbound")) {
+		on_subscription = cli_show_subscriptions_outbound;
+	} else {
+		/* Should never get here */
+		ast_assert(0);
+		return CLI_SHOWUSAGE;
+	}
+	if (a->argc == 6) {
+		int rc;
+
+		if (strcasecmp(a->argv[4], "like")) {
+			return CLI_SHOWUSAGE;
+		}
+
+		/* Setup regular expression */
+		memset(&like, 0, sizeof(like));
+		cli.like = &like;
+		regex = a->argv[5];
+		rc = regcomp(cli.like, regex, REG_EXTENDED | REG_NOSUB);
+		if (rc) {
+			char *regerr = ast_alloca(MAX_REGEX_ERROR_LEN);
+
+			regerror(rc, cli.like, regerr, MAX_REGEX_ERROR_LEN);
+			ast_cli(a->fd, "Regular expression '%s' failed to compile: %s\n",
+				regex, regerr);
+			return CLI_FAILURE;
+		}
+	} else {
+		cli.like = NULL;
+		regex = NULL;
+	}
+
+	cli.a = a;
+	cli.e = e;
+	cli.count = 0;
+	cli.buf = ast_str_create(256);
+	if (!cli.buf) {
+		if (cli.like) {
+			regfree(cli.like);
+		}
+		return CLI_FAILURE;
+	}
+
+	ast_cli(a->fd, CLI_SHOW_SUB_FORMAT_HEADER);
+	for_each_subscription(on_subscription, &cli);
+	ast_cli(a->fd, "%d active subscriptions%s%s%s\n",
+		cli.count,
+		regex ? " matched \"" : "",
+		regex ?: "",
+		regex ? "\"" : "");
+
+	ast_free(cli.buf);
+	if (cli.like) {
+		regfree(cli.like);
+	}
+
+	return CLI_SUCCESS;
+}
+
+#define CLI_LIST_SUB_FORMAT_HEADER "%-30.30s %-30.30s %6.6s %s\n"
+#define CLI_LIST_SUB_FORMAT_ENTRY  "%-30.30s %-30.30s %6d %s\n"
+
+static int cli_list_subscriptions_detail(struct sip_subscription_tree *sub_tree, struct cli_sub_parms *cli)
+{
+	char ep_cid_buf[50];
+	char res_evt_buf[50];
+	char callid[256];
+
+	/* Endpoint/CID column */
+	snprintf(ep_cid_buf, sizeof(ep_cid_buf), "%s/%s",
+		ast_sorcery_object_get_id(sub_tree->endpoint),
+		S_COR(sub_tree->endpoint->id.self.name.valid, sub_tree->endpoint->id.self.name.str,
+			S_COR(sub_tree->endpoint->id.self.number.valid,
+				sub_tree->endpoint->id.self.number.str, "<none>")));
+
+	/* Resource/Event column */
+	snprintf(res_evt_buf, sizeof(res_evt_buf), "%s/%s",
+		sub_tree->root->resource,
+		sub_tree->root->handler->event_name);
+
+	/* Call-id column */
+	if (sub_tree->dlg) {
+		ast_copy_pj_str(callid, &sub_tree->dlg->call_id->id, sizeof(callid));
+	} else {
+		ast_copy_string(callid, "<unknown>", sizeof(callid));
+	}
+
+	ast_str_set(&cli->buf, 0, CLI_LIST_SUB_FORMAT_ENTRY,
+		ep_cid_buf,
+		res_evt_buf,
+		cli_subscription_expiry(sub_tree),
+		callid);
+
+	if (cli->like) {
+		if (regexec(cli->like, ast_str_buffer(cli->buf), 0, NULL, 0)) {
+			/* Output line did not match the regex */
+			return 0;
+		}
+	}
+
+	ast_cli(cli->a->fd, "%s", ast_str_buffer(cli->buf));
+	++cli->count;
+
+	return 0;
+}
+
+static int cli_list_subscriptions_inbound(struct sip_subscription_tree *sub_tree, void *arg)
+{
+	return sub_tree->role == AST_SIP_NOTIFIER
+		? cli_list_subscriptions_detail(sub_tree, arg) : 0;
+}
+
+static int cli_list_subscriptions_outbound(struct sip_subscription_tree *sub_tree, void *arg)
+{
+	return sub_tree->role == AST_SIP_SUBSCRIBER
+		? cli_list_subscriptions_detail(sub_tree, arg) : 0;
+}
+
+static char *cli_list_subscriptions_inout(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	on_subscription_t on_subscription;
+	struct cli_sub_parms cli;
+	regex_t like;
+	const char *regex;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "pjsip list subscriptions {inbound|outbound} [like]";
+		e->usage = "Usage:\n"
+				   "   pjsip list subscriptions inbound [like <regex>]\n"
+				   "      List active inbound subscriptions\n"
+				   "   pjsip list subscriptions outbound [like <regex>]\n"
+				   "      List active outbound subscriptions\n"
+				   "\n"
+				   "   The regex selects output lines that match.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc != 4 && a->argc != 6) {
+		return CLI_SHOWUSAGE;
+	}
+	if (!strcasecmp(a->argv[3], "inbound")) {
+		on_subscription = cli_list_subscriptions_inbound;
+	} else if (!strcasecmp(a->argv[3], "outbound")) {
+		on_subscription = cli_list_subscriptions_outbound;
+	} else {
+		/* Should never get here */
+		ast_assert(0);
+		return CLI_SHOWUSAGE;
+	}
+	if (a->argc == 6) {
+		int rc;
+
+		if (strcasecmp(a->argv[4], "like")) {
+			return CLI_SHOWUSAGE;
+		}
+
+		/* Setup regular expression */
+		memset(&like, 0, sizeof(like));
+		cli.like = &like;
+		regex = a->argv[5];
+		rc = regcomp(cli.like, regex, REG_EXTENDED | REG_NOSUB);
+		if (rc) {
+			char *regerr = ast_alloca(MAX_REGEX_ERROR_LEN);
+
+			regerror(rc, cli.like, regerr, MAX_REGEX_ERROR_LEN);
+			ast_cli(a->fd, "Regular expression '%s' failed to compile: %s\n",
+				regex, regerr);
+			return CLI_FAILURE;
+		}
+	} else {
+		cli.like = NULL;
+		regex = NULL;
+	}
+
+	cli.a = a;
+	cli.e = e;
+	cli.count = 0;
+	cli.buf = ast_str_create(256);
+	if (!cli.buf) {
+		if (cli.like) {
+			regfree(cli.like);
+		}
+		return CLI_FAILURE;
+	}
+
+	ast_cli(a->fd, CLI_LIST_SUB_FORMAT_HEADER,
+		"Endpoint/CLI", "Resource/Event", "Expiry", "Call-id");
+	for_each_subscription(on_subscription, &cli);
+	ast_cli(a->fd, "\n%d active subscriptions%s%s%s\n",
+		cli.count,
+		regex ? " matched \"" : "",
+		regex ?: "",
+		regex ? "\"" : "");
+
+	ast_free(cli.buf);
+	if (cli.like) {
+		regfree(cli.like);
+	}
+
+	return CLI_SUCCESS;
+}
+
+static struct ast_cli_entry cli_commands[] = {
+	AST_CLI_DEFINE(cli_list_subscriptions_inout, "List active inbound/outbound subscriptions"),
+	AST_CLI_DEFINE(cli_show_subscription_inout, "Show active subscription details"),
+	AST_CLI_DEFINE(cli_show_subscriptions_inout, "Show active inbound/outbound subscriptions"),
+};
 
 static int persistence_endpoint_str2struct(const struct aco_option *opt, struct ast_variable *var, void *obj)
 {
@@ -3767,7 +4724,10 @@ static int list_item_handler(const struct aco_option *opt,
 			ast_log(LOG_WARNING, "Ignoring duplicated list item '%s'\n", item);
 			continue;
 		}
-		if (AST_VECTOR_APPEND(&list->items, ast_strdup(item))) {
+
+		item = ast_strdup(item);
+		if (!item || AST_VECTOR_APPEND(&list->items, item)) {
+			ast_free(item);
 			return -1;
 		}
 	}
@@ -3903,7 +4863,10 @@ static int populate_list(struct resource_list *list, const char *event, const ch
 	ast_copy_string(list->event, event, sizeof(list->event));
 
 	for (i = 0; i < num_resources; ++i) {
-		if (AST_VECTOR_APPEND(&list->items, ast_strdup(resources[i]))) {
+		char *resource = ast_strdup(resources[i]);
+
+		if (!resource || AST_VECTOR_APPEND(&list->items, resource)) {
+			ast_free(resource);
 			return -1;
 		}
 	}
@@ -4516,29 +5479,17 @@ static int load_module(void)
 	static const pj_str_t str_PUBLISH = { "PUBLISH", 7 };
 	struct ast_sorcery *sorcery;
 
-	CHECK_PJSIP_MODULE_LOADED();
-
 	sorcery = ast_sip_get_sorcery();
-
-	pjsip_evsub_init_module(ast_sip_get_pjsip_endpoint());
 
 	if (!(sched = ast_sched_context_create())) {
 		ast_log(LOG_ERROR, "Could not create scheduler for publication expiration\n");
-		return AST_MODULE_LOAD_FAILURE;
+		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	if (ast_sched_start_thread(sched)) {
 		ast_log(LOG_ERROR, "Could not start scheduler thread for publication expiration\n");
 		ast_sched_context_destroy(sched);
-		return AST_MODULE_LOAD_FAILURE;
-	}
-
-	pjsip_endpt_add_capability(ast_sip_get_pjsip_endpoint(), NULL, PJSIP_H_ALLOW, NULL, 1, &str_PUBLISH);
-
-	if (ast_sip_register_service(&pubsub_module)) {
-		ast_log(LOG_ERROR, "Could not register pubsub service\n");
-		ast_sched_context_destroy(sched);
-		return AST_MODULE_LOAD_FAILURE;
+		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	ast_sorcery_apply_config(sorcery, "res_pjsip_pubsub");
@@ -4546,9 +5497,8 @@ static int load_module(void)
 	if (ast_sorcery_object_register(sorcery, "subscription_persistence", subscription_persistence_alloc,
 		NULL, NULL)) {
 		ast_log(LOG_ERROR, "Could not register subscription persistence object support\n");
-		ast_sip_unregister_service(&pubsub_module);
 		ast_sched_context_destroy(sched);
-		return AST_MODULE_LOAD_FAILURE;
+		return AST_MODULE_LOAD_DECLINE;
 	}
 	ast_sorcery_object_field_register(sorcery, "subscription_persistence", "packet", "", OPT_CHAR_ARRAY_T, 0,
 		CHARFLDSET(struct subscription_persistence, packet));
@@ -4570,26 +5520,49 @@ static int load_module(void)
 		persistence_tag_str2struct, persistence_tag_struct2str, NULL, 0, 0);
 	ast_sorcery_object_field_register_custom(sorcery, "subscription_persistence", "expires", "",
 		persistence_expires_str2struct, persistence_expires_struct2str, NULL, 0, 0);
+	ast_sorcery_object_field_register(sorcery, "subscription_persistence", "contact_uri", "", OPT_CHAR_ARRAY_T, 0,
+		CHARFLDSET(struct subscription_persistence, contact_uri));
+	ast_sorcery_object_field_register(sorcery, "subscription_persistence", "prune_on_boot", "no", OPT_YESNO_T, 1,
+		FLDSET(struct subscription_persistence, prune_on_boot));
 
 	if (apply_list_configuration(sorcery)) {
-		ast_sip_unregister_service(&pubsub_module);
 		ast_sched_context_destroy(sched);
-		return AST_MODULE_LOAD_FAILURE;
+		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	ast_sorcery_apply_default(sorcery, "inbound-publication", "config", "pjsip.conf,criteria=type=inbound-publication");
 	if (ast_sorcery_object_register(sorcery, "inbound-publication", publication_resource_alloc,
 		NULL, NULL)) {
 		ast_log(LOG_ERROR, "Could not register subscription persistence object support\n");
-		ast_sip_unregister_service(&pubsub_module);
 		ast_sched_context_destroy(sched);
-		return AST_MODULE_LOAD_FAILURE;
+		return AST_MODULE_LOAD_DECLINE;
 	}
 	ast_sorcery_object_field_register(sorcery, "inbound-publication", "type", "", OPT_NOOP_T, 0, 0);
 	ast_sorcery_object_field_register_custom(sorcery, "inbound-publication", "endpoint", "",
 		resource_endpoint_handler, NULL, NULL, 0, 0);
 	ast_sorcery_object_fields_register(sorcery, "inbound-publication", "^event_", resource_event_handler, NULL);
 	ast_sorcery_reload_object(sorcery, "inbound-publication");
+
+	if (ast_sip_register_service(&pubsub_module)) {
+		ast_log(LOG_ERROR, "Could not register pubsub service\n");
+		ast_sched_context_destroy(sched);
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
+	if (pjsip_evsub_init_module(ast_sip_get_pjsip_endpoint()) != PJ_SUCCESS) {
+		ast_log(LOG_ERROR, "Could not initialize pjsip evsub module.\n");
+		ast_sip_unregister_service(&pubsub_module);
+		ast_sched_context_destroy(sched);
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
+	/* Once pjsip_evsub_init_module succeeds we cannot unload.
+	 * Keep all module_load errors above this point. */
+	ast_module_shutdown_ref(ast_module_info->self);
+
+	pjsip_media_type_init2(&rlmi_media_type, "application", "rlmi+xml");
+
+	pjsip_endpt_add_capability(ast_sip_get_pjsip_endpoint(), NULL, PJSIP_H_ALLOW, NULL, 1, &str_PUBLISH);
 
 	if (ast_test_flag(&ast_options, AST_OPT_FLAG_FULLY_BOOTED)) {
 		ast_sip_push_task(NULL, subscription_persistence_load, NULL);
@@ -4604,6 +5577,8 @@ static int load_module(void)
 	ast_manager_register_xml("PJSIPShowResourceLists", EVENT_FLAG_SYSTEM,
 			ami_show_resource_lists);
 
+	ast_cli_register_multiple(cli_commands, ARRAY_LEN(cli_commands));
+
 	AST_TEST_REGISTER(resource_tree);
 	AST_TEST_REGISTER(complex_resource_tree);
 	AST_TEST_REGISTER(bad_resource);
@@ -4617,6 +5592,18 @@ static int load_module(void)
 
 static int unload_module(void)
 {
+	AST_TEST_UNREGISTER(resource_tree);
+	AST_TEST_UNREGISTER(complex_resource_tree);
+	AST_TEST_UNREGISTER(bad_resource);
+	AST_TEST_UNREGISTER(bad_branch);
+	AST_TEST_UNREGISTER(duplicate_resource);
+	AST_TEST_UNREGISTER(loop);
+	AST_TEST_UNREGISTER(bad_event);
+
+	ast_sip_transport_monitor_unregister_all(sub_tree_transport_cb, NULL, NULL);
+
+	ast_cli_unregister_multiple(cli_commands, ARRAY_LEN(cli_commands));
+
 	ast_manager_unregister(AMI_SHOW_SUBSCRIPTIONS_OUTBOUND);
 	ast_manager_unregister(AMI_SHOW_SUBSCRIPTIONS_INBOUND);
 	ast_manager_unregister("PJSIPShowResourceLists");
@@ -4626,14 +5613,6 @@ static int unload_module(void)
 		ast_sched_context_destroy(sched);
 	}
 
-	AST_TEST_UNREGISTER(resource_tree);
-	AST_TEST_UNREGISTER(complex_resource_tree);
-	AST_TEST_UNREGISTER(bad_resource);
-	AST_TEST_UNREGISTER(bad_branch);
-	AST_TEST_UNREGISTER(duplicate_resource);
-	AST_TEST_UNREGISTER(loop);
-	AST_TEST_UNREGISTER(bad_event);
-
 	return 0;
 }
 
@@ -4642,4 +5621,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_
 	.load = load_module,
 	.unload = unload_module,
 	.load_pri = AST_MODPRI_CHANNEL_DEPEND,
+	.requires = "res_pjsip",
 );

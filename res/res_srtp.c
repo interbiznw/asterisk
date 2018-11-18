@@ -30,6 +30,7 @@
 
 /*** MODULEINFO
 	<depend>srtp</depend>
+	<use type="external">openssl</use>
 	<support_level>core</support_level>
 ***/
 
@@ -37,14 +38,19 @@
 
 #include "asterisk.h"                   /* for NULL, size_t, memcpy, etc */
 
-ASTERISK_REGISTER_FILE()
-
 #include <math.h>                       /* for pow */
-#include <srtp/srtp.h>
-#ifdef HAVE_OPENSSL
-#include <openssl/rand.h>
+
+#if HAVE_SRTP_VERSION > 1
+# include <srtp2/srtp.h>
+# include "srtp/srtp_compat.h"
+# include <openssl/rand.h>
 #else
-#include <srtp/crypto_kernel.h>
+# include <srtp/srtp.h>
+# ifdef HAVE_OPENSSL
+#  include <openssl/rand.h>
+# else
+#  include <srtp/crypto_kernel.h>
+# endif
 #endif
 
 #include "asterisk/astobj2.h"           /* for ao2_t_ref, etc */
@@ -188,11 +194,13 @@ static struct ast_srtp *res_srtp_new(void)
 		return NULL;
 	}
 
-	if (!(srtp->policies = ao2_t_container_alloc(5, policy_hash_fn, policy_cmp_fn, "SRTP policy container"))) {
+	srtp->policies = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, 5,
+		policy_hash_fn, NULL, policy_cmp_fn, "SRTP policy container");
+	if (!srtp->policies) {
 		ast_free(srtp);
 		return NULL;
 	}
-	
+
 	srtp->warned = 1;
 
 	return srtp;
@@ -440,11 +448,26 @@ tryagain:
 	}
 
 	if (res != err_status_ok && res != err_status_replay_fail ) {
-		if ((srtp->warned >= 10) && !((srtp->warned - 10) % 100)) {
-			ast_log(AST_LOG_WARNING, "SRTP unprotect failed with: %s %d\n", srtp_errstr(res), srtp->warned);
-			srtp->warned = 11;
+		/*
+		 * Authentication failures happen when an active attacker tries to
+		 * insert malicious RTP packets. Furthermore, authentication failures
+		 * happen, when the other party encrypts the sRTP data in an unexpected
+		 * way. This happens quite often with RTCP. Therefore, when you see
+		 * authentication failures, try to identify the implementation
+		 * (author and product name) used by your other party. Try to investigate
+		 * whether they use a custom library or an outdated version of libSRTP.
+		 */
+		if (rtcp) {
+			ast_verb(2, "SRTCP unprotect failed on SSRC %u because of %s\n",
+				ast_rtp_instance_get_ssrc(srtp->rtp), srtp_errstr(res));
 		} else {
-			srtp->warned++;
+			if ((srtp->warned >= 10) && !((srtp->warned - 10) % 150)) {
+				ast_verb(2, "SRTP unprotect failed on SSRC %u because of %s %d\n",
+					ast_rtp_instance_get_ssrc(srtp->rtp), srtp_errstr(res), srtp->warned);
+				srtp->warned = 11;
+			} else {
+				srtp->warned++;
+			}
 		}
 		errno = EAGAIN;
 		return -1;
@@ -461,7 +484,7 @@ static int ast_srtp_protect(struct ast_srtp *srtp, void **buf, int *len, int rtc
 	if ((*len + SRTP_MAX_TRAILER_LEN) > sizeof(srtp->buf)) {
 		return -1;
 	}
-	
+
 	localbuf = rtcp ? srtp->rtcpbuf : srtp->buf;
 
 	memcpy(localbuf, *buf, *len);
@@ -784,8 +807,8 @@ static int res_sdp_crypto_parse_offer(struct ast_rtp_instance *rtp, struct ast_s
 		return -1;
 	}
 
-	/* RFC4568 9.1 - tag is 1-9 digits, greater than zero */
-	if (sscanf(tag, "%30d", &tag_from_sdp) != 1 || tag_from_sdp <= 0 || tag_from_sdp > 999999999) {
+	/* RFC4568 9.1 - tag is 1-9 digits */
+	if (sscanf(tag, "%30d", &tag_from_sdp) != 1 || tag_from_sdp < 0 || tag_from_sdp > 999999999) {
 		ast_log(LOG_WARNING, "Unacceptable a=crypto tag: %s\n", tag);
 		return -1;
 	}
@@ -959,8 +982,8 @@ static int res_sdp_crypto_parse_offer(struct ast_rtp_instance *rtp, struct ast_s
 				sdes_lifetime = n_lifetime;
 			}
 
-			/* Accept anything above 10 hours. Less than 10; reject. */
-			if (sdes_lifetime < 1800000) {
+			/* Accept anything above ~5.8 hours. Less than ~5.8; reject. */
+			if (sdes_lifetime < 1048576) {
 				ast_log(LOG_NOTICE, "Rejecting crypto attribute '%s': lifetime '%f' too short\n", attr, sdes_lifetime);
 				continue;
 			}
@@ -994,7 +1017,6 @@ static int res_sdp_crypto_parse_offer(struct ast_rtp_instance *rtp, struct ast_s
 		}
 	} else if (!memcmp(crypto->remote_key, remote_key, key_len_from_sdp)) {
 		ast_debug(1, "SRTP remote key unchanged; maintaining current policy\n");
-		ast_set_flag(srtp, AST_SRTP_CRYPTO_OFFER_OK);
 		return 0;
 	}
 
@@ -1191,6 +1213,12 @@ static int res_srtp_init(void)
 		res_srtp_shutdown();
 		return -1;
 	}
+
+#ifdef HAVE_SRTP_GET_VERSION
+	ast_verb(2, "%s initialized\n", srtp_get_version_string());
+#else
+	ast_verb(2, "libsrtp initialized\n");
+#endif
 
 	g_initialized = 1;
 	return 0;

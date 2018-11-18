@@ -49,8 +49,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include <libpq-fe.h>
 
 #include "asterisk/config.h"
@@ -60,6 +58,8 @@ ASTERISK_REGISTER_FILE()
 #include "asterisk/module.h"
 
 #define DATE_FORMAT "'%Y-%m-%d %T'"
+
+#define PGSQL_MIN_VERSION_SCHEMA 70300
 
 static const char name[] = "pgsql";
 static const char config[] = "cdr_pgsql.conf";
@@ -204,6 +204,7 @@ static int pgsql_log(struct ast_cdr *cdr)
 	struct ast_tm tm;
 	char *pgerror;
 	PGresult *result;
+	int res = -1;
 
 	ast_mutex_lock(&pgsql_lock);
 
@@ -233,13 +234,14 @@ static int pgsql_log(struct ast_cdr *cdr)
 	if (connected) {
 		struct columns *cur;
 		struct ast_str *sql = ast_str_create(maxsize), *sql2 = ast_str_create(maxsize2);
-		char buf[257], escapebuf[513], *value;
+		char buf[257];
+		char *escapebuf = NULL, *value;
 		char *separator = "";
+		size_t bufsize = 513;
 
-		if (!sql || !sql2) {
-			ast_free(sql);
-			ast_free(sql2);
-			return -1;
+		escapebuf = ast_malloc(bufsize);
+		if (!escapebuf || !sql || !sql2) {
+			goto ast_log_cleanup;
 		}
 
 		ast_str_set(&sql, 0, "INSERT INTO %s (", table);
@@ -360,10 +362,28 @@ static int pgsql_log(struct ast_cdr *cdr)
 					}
 				/* XXX Might want to handle dates, times, and other misc fields here XXX */
 				} else {
-					if (value)
+					if (value) {
+						size_t required_size = strlen(value) * 2 + 1;
+
+						/* If our argument size exceeds our buffer, grow it,
+						 * as PQescapeStringConn() expects the buffer to be
+						 * adequitely sized and does *NOT* do size checking.
+						 */
+						if (required_size > bufsize) {
+							char *tmpbuf = ast_realloc(escapebuf, required_size);
+
+							if (!tmpbuf) {
+								AST_RWLIST_UNLOCK(&psql_columns);
+								goto ast_log_cleanup;
+							}
+
+							escapebuf = tmpbuf;
+							bufsize = required_size;
+						}
 						PQescapeStringConn(conn, escapebuf, value, strlen(value), NULL);
-					else
+					} else {
 						escapebuf[0] = '\0';
+					}
 					LENGTHEN_BUF2(strlen(escapebuf) + 3);
 					ast_str_append(&sql2, 0, "%s'%s'", separator, escapebuf);
 				}
@@ -397,10 +417,7 @@ static int pgsql_log(struct ast_cdr *cdr)
 				PQfinish(conn);
 				conn = NULL;
 				connected = 0;
-				ast_mutex_unlock(&pgsql_lock);
-				ast_free(sql);
-				ast_free(sql2);
-				return -1;
+				goto ast_log_cleanup;
 			}
 		}
 		result = PQexec(conn, ast_str_buffer(sql));
@@ -421,23 +438,17 @@ static int pgsql_log(struct ast_cdr *cdr)
 					pgerror = PQresultErrorMessage(result);
 					ast_log(LOG_ERROR, "HARD ERROR!  Attempted reconnection failed.  DROPPING CALL RECORD!\n");
 					ast_log(LOG_ERROR, "Reason: %s\n", pgerror);
-				}  else {
+				} else {
 					/* Second try worked out ok */
 					totalrecords++;
 					records++;
-					ast_mutex_unlock(&pgsql_lock);
-					PQclear(result);
-					return 0;
+					res = 0;
 				}
 			}
-			ast_mutex_unlock(&pgsql_lock);
-			PQclear(result);
-			ast_free(sql);
-			ast_free(sql2);
-			return -1;
 		} else {
 			totalrecords++;
 			records++;
+			res = 0;
 		}
 		PQclear(result);
 
@@ -449,11 +460,14 @@ static int pgsql_log(struct ast_cdr *cdr)
 			maxsize2 = ast_str_strlen(sql2);
 		}
 
+ast_log_cleanup:
+		ast_free(escapebuf);
 		ast_free(sql);
 		ast_free(sql2);
 	}
+
 	ast_mutex_unlock(&pgsql_lock);
-	return 0;
+	return res;
 }
 
 /* This function should be called without holding the pgsql_columns lock */
@@ -630,20 +644,20 @@ static int config_module(int reload)
 		return -1;
 	}
 
-	if (option_debug) {
+	if (DEBUG_ATLEAST(1)) {
 		if (ast_strlen_zero(pghostname)) {
-			ast_debug(1, "using default unix socket\n");
+			ast_log(LOG_DEBUG, "using default unix socket\n");
 		} else {
-			ast_debug(1, "got hostname of %s\n", pghostname);
+			ast_log(LOG_DEBUG, "got hostname of %s\n", pghostname);
 		}
-		ast_debug(1, "got port of %s\n", pgdbport);
-		ast_debug(1, "got user of %s\n", pgdbuser);
-		ast_debug(1, "got dbname of %s\n", pgdbname);
-		ast_debug(1, "got password of %s\n", pgpassword);
-		ast_debug(1, "got application name of %s\n", pgappname);
-		ast_debug(1, "got sql table name of %s\n", table);
-		ast_debug(1, "got encoding of %s\n", encoding);
-		ast_debug(1, "got timezone of %s\n", tz);
+		ast_log(LOG_DEBUG, "got port of %s\n", pgdbport);
+		ast_log(LOG_DEBUG, "got user of %s\n", pgdbuser);
+		ast_log(LOG_DEBUG, "got dbname of %s\n", pgdbname);
+		ast_log(LOG_DEBUG, "got password of %s\n", pgpassword);
+		ast_log(LOG_DEBUG, "got application name of %s\n", pgappname);
+		ast_log(LOG_DEBUG, "got sql table name of %s\n", table);
+		ast_log(LOG_DEBUG, "got encoding of %s\n", encoding);
+		ast_log(LOG_DEBUG, "got timezone of %s\n", tz);
 	}
 
 	pgsql_reconnect();
@@ -665,7 +679,7 @@ static int config_module(int reload)
 		}
 		version = PQserverVersion(conn);
 
-		if (version >= 70300) {
+		if (version >= PGSQL_MIN_VERSION_SCHEMA) {
 			char *schemaname, *tablename, *tmp_schemaname, *tmp_tablename;
 			if (strchr(table, '.')) {
 				tmp_schemaname = ast_strdupa(table);
@@ -780,4 +794,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "PostgreSQL CDR Backen
 	.unload = unload_module,
 	.reload = reload,
 	.load_pri = AST_MODPRI_CDR_DRIVER,
+	.requires = "cdr",
 );

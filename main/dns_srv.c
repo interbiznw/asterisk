@@ -29,8 +29,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include <netinet/in.h>
 #include <arpa/nameser.h>
 #include <resolv.h>
@@ -75,7 +73,13 @@ struct ast_dns_record *dns_srv_alloc(struct ast_dns_query *query, const char *da
 		return NULL;
 	}
 
-	host_size = dn_expand((unsigned char *)query->result->answer, (unsigned char *) end_of_record, (unsigned char *) ptr, host, sizeof(host) - 1);
+	/*
+	 * The return value from dn_expand represents the size of the replacement
+	 * in the buffer which MAY be compressed.  Since the expanded replacement
+	 * is NULL terminated, you can use strlen() to get the expanded size.
+	 */
+	host_size = dn_expand((unsigned char *)query->result->answer,
+		(unsigned char *) end_of_record, (unsigned char *) ptr, host, sizeof(host) - 1);
 	if (host_size < 0) {
 		ast_log(LOG_ERROR, "Failed to expand domain name: %s\n", strerror(errno));
 		return NULL;
@@ -85,7 +89,7 @@ struct ast_dns_record *dns_srv_alloc(struct ast_dns_query *query, const char *da
 		return NULL;
 	}
 
-	srv = ast_calloc(1, sizeof(*srv) + size + host_size + 1);
+	srv = ast_calloc(1, sizeof(*srv) + size + strlen(host) + 1);
 	if (!srv) {
 		return NULL;
 	}
@@ -96,8 +100,6 @@ struct ast_dns_record *dns_srv_alloc(struct ast_dns_query *query, const char *da
 
 	srv->host = srv->data + size;
 	strcpy((char *)srv->host, host); /* SAFE */
-	((char *)srv->host)[host_size] = '\0';
-
 	srv->generic.data_ptr = srv->data;
 
 	return (struct ast_dns_record *)srv;
@@ -185,7 +187,7 @@ const char *ast_dns_srv_get_host(const struct ast_dns_record *record)
 {
 	struct ast_dns_srv_record *srv = (struct ast_dns_srv_record *) record;
 
-	ast_assert(ast_dns_record_get_rr_type(record) == ns_t_srv);
+	ast_assert(ast_dns_record_get_rr_type(record) == T_SRV);
 	return srv->host;
 }
 
@@ -193,7 +195,7 @@ unsigned short ast_dns_srv_get_priority(const struct ast_dns_record *record)
 {
 	struct ast_dns_srv_record *srv = (struct ast_dns_srv_record *) record;
 
-	ast_assert(ast_dns_record_get_rr_type(record) == ns_t_srv);
+	ast_assert(ast_dns_record_get_rr_type(record) == T_SRV);
 	return srv->priority;
 }
 
@@ -201,7 +203,7 @@ unsigned short ast_dns_srv_get_weight(const struct ast_dns_record *record)
 {
 	struct ast_dns_srv_record *srv = (struct ast_dns_srv_record *) record;
 
-	ast_assert(ast_dns_record_get_rr_type(record) == ns_t_srv);
+	ast_assert(ast_dns_record_get_rr_type(record) == T_SRV);
 	return srv->weight;
 }
 
@@ -209,6 +211,6 @@ unsigned short ast_dns_srv_get_port(const struct ast_dns_record *record)
 {
 	struct ast_dns_srv_record *srv = (struct ast_dns_srv_record *) record;
 
-	ast_assert(ast_dns_record_get_rr_type(record) == ns_t_srv);
+	ast_assert(ast_dns_record_get_rr_type(record) == T_SRV);
 	return srv->port;
 }

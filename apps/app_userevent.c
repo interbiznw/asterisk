@@ -17,7 +17,7 @@
 /*! \file
  *
  * \brief UserEvent application -- send manager event
- * 
+ *
  * \ingroup applications
  */
 
@@ -26,8 +26,6 @@
  ***/
 
 #include "asterisk.h"
-
-ASTERISK_REGISTER_FILE()
 
 #include "asterisk/pbx.h"
 #include "asterisk/module.h"

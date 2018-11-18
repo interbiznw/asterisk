@@ -29,7 +29,7 @@
 #include "asterisk/res_pjsip_cli.h"
 
 #define DEFAULT_MAX_FORWARDS 70
-#define DEFAULT_KEEPALIVE_INTERVAL 0
+#define DEFAULT_KEEPALIVE_INTERVAL 90
 #define DEFAULT_USERAGENT_PREFIX "Asterisk PBX"
 #define DEFAULT_OUTBOUND_ENDPOINT "default_outbound_endpoint"
 #define DEFAULT_DEBUG "no"
@@ -47,6 +47,8 @@
 #define DEFAULT_MWI_TPS_QUEUE_HIGH AST_TASKPROCESSOR_HIGH_WATER_LEVEL
 #define DEFAULT_MWI_TPS_QUEUE_LOW -1
 #define DEFAULT_MWI_DISABLE_INITIAL_UNSOLICITED 0
+#define DEFAULT_IGNORE_URI_USER_OPTIONS 0
+#define DEFAULT_USE_CALLERID_CONTACT 0
 
 /*!
  * \brief Cached global config object
@@ -100,6 +102,10 @@ struct global_config {
 		/*! Nonzero to disable sending unsolicited mwi to all endpoints on startup */
 		unsigned int disable_initial_unsolicited;
 	} mwi;
+	/*! Nonzero if URI user field options are ignored. */
+	unsigned int ignore_uri_user_options;
+	/*! Nonzero if CALLERID(num) is to be used as the default contact username instead of default_from_user */
+	unsigned int use_callerid_contact;
 };
 
 static void global_destructor(void *obj)
@@ -384,6 +390,35 @@ unsigned int ast_sip_get_mwi_disable_initial_unsolicited(void)
 	return disable_initial_unsolicited;
 }
 
+unsigned int ast_sip_get_ignore_uri_user_options(void)
+{
+	unsigned int ignore_uri_user_options;
+	struct global_config *cfg;
+
+	cfg = get_global_cfg();
+	if (!cfg) {
+		return DEFAULT_IGNORE_URI_USER_OPTIONS;
+	}
+
+	ignore_uri_user_options = cfg->ignore_uri_user_options;
+	ao2_ref(cfg, -1);
+	return ignore_uri_user_options;
+}
+
+unsigned int ast_sip_get_use_callerid_contact(void)
+{
+	unsigned int use_callerid_contact;
+	struct global_config *cfg;
+
+	cfg = get_global_cfg();
+	if (!cfg) {
+		return DEFAULT_USE_CALLERID_CONTACT;
+	}
+
+	use_callerid_contact = cfg->use_callerid_contact;
+	ao2_ref(cfg, -1);
+	return use_callerid_contact;
+}
 
 /*!
  * \internal
@@ -474,7 +509,7 @@ int ast_sip_initialize_sorcery_global(void)
 	snprintf(default_useragent, sizeof(default_useragent), "%s %s",
 		DEFAULT_USERAGENT_PREFIX, ast_get_version());
 
-	ast_sorcery_apply_default(sorcery, "global", "config", "pjsip.conf,criteria=type=global");
+	ast_sorcery_apply_default(sorcery, "global", "config", "pjsip.conf,criteria=type=global,single_object=yes,explicit_name=global");
 
 	if (ast_sorcery_object_register(sorcery, "global", global_alloc, NULL, global_apply)) {
 		return -1;
@@ -533,6 +568,12 @@ int ast_sip_initialize_sorcery_global(void)
 	ast_sorcery_object_field_register(sorcery, "global", "mwi_disable_initial_unsolicited",
 		DEFAULT_MWI_DISABLE_INITIAL_UNSOLICITED ? "yes" : "no",
 		OPT_BOOL_T, 1, FLDSET(struct global_config, mwi.disable_initial_unsolicited));
+	ast_sorcery_object_field_register(sorcery, "global", "ignore_uri_user_options",
+		DEFAULT_IGNORE_URI_USER_OPTIONS ? "yes" : "no",
+		OPT_BOOL_T, 1, FLDSET(struct global_config, ignore_uri_user_options));
+	ast_sorcery_object_field_register(sorcery, "global", "use_callerid_contact",
+		DEFAULT_USE_CALLERID_CONTACT ? "yes" : "no",
+		OPT_YESNO_T, 1, FLDSET(struct global_config, use_callerid_contact));
 
 	if (ast_sorcery_instance_observer_add(sorcery, &observer_callbacks_global)) {
 		return -1;

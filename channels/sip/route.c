@@ -20,12 +20,10 @@
  */
 
 /*** MODULEINFO
-	<support_level>extended</support_level>
+	<support_level>deprecated</support_level>
  ***/
 
 #include "asterisk.h"
-
-ASTERISK_REGISTER_FILE()
 
 #include "asterisk/utils.h"
 

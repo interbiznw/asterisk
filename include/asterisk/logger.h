@@ -69,6 +69,9 @@ enum ast_logger_results {
 void ast_log(int level, const char *file, int line, const char *function, const char *fmt, ...)
 	__attribute__((format(printf, 5, 6)));
 
+void ast_log_ap(int level, const char *file, int line, const char *function, const char *fmt, va_list ap)
+	 __attribute__((format(printf, 5, 0)));
+
 /*!
  * \brief Used for sending a log message with protection against recursion.
  *
@@ -132,9 +135,6 @@ int ast_logger_remove_channel(const char *log_channel);
  * \brief Log a backtrace of the current thread's execution stack to the Asterisk log
  */
 void ast_log_backtrace(void);
-
-/*! \brief Reload logger without rotating log files */
-int logger_reload(void);
 
 /*! \brief Reload logger while rotating log files */
 int ast_logger_rotate(void);
@@ -310,14 +310,6 @@ void ast_console_toggle_loglevel(int fd, int level, int state);
 unsigned int ast_debug_get_by_module(const char *module);
 
 /*!
- * \brief Get the verbose level for a module
- * \param module the name of module
- * \return the verbose level
- * \version 11.0.0 deprecated
- */
-unsigned int ast_verbose_get_by_module(const char *module) __attribute__((deprecated));
-
-/*!
  * \brief Register a new logger level
  * \param name The name of the level to be registered
  * \retval -1 if an error occurs
@@ -429,7 +421,9 @@ void ast_callid_strnprint(char *buffer, size_t buffer_size, ast_callid callid);
 
 #define DEBUG_ATLEAST(level) \
 	(option_debug >= (level) \
-		|| (ast_opt_dbg_module && (int)ast_debug_get_by_module(AST_MODULE) >= (level)))
+		|| (ast_opt_dbg_module \
+        	&& ((int)ast_debug_get_by_module(AST_MODULE) >= (level) \
+				|| (int)ast_debug_get_by_module(__FILE__) >= (level))))
 
 /*!
  * \brief Log a DEBUG message
@@ -499,6 +493,29 @@ int ast_verb_console_get(void);
  * \return Nothing
  */
 void ast_verb_console_set(int verb_level);
+
+/*!
+ * \brief Test if logger is initialized
+ *
+ * \retval true if the logger is initialized
+ */
+int ast_is_logger_initialized(void);
+
+/*!
+ * \brief Set the maximum number of messages allowed in the processing queue
+ *
+ * \param queue_limit
+ *
+ * \return Nothing
+ */
+void ast_logger_set_queue_limit(int queue_limit);
+
+/*!
+ * \brief Get the maximum number of messages allowed in the processing queue
+ *
+ * \return Queue limit
+ */
+int ast_logger_get_queue_limit(void);
 
 #if defined(__cplusplus) || defined(c_plusplus)
 }

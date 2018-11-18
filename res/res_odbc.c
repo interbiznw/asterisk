@@ -22,7 +22,7 @@
 /*! \file
  *
  * \brief ODBC resource manager
- * 
+ *
  * \author Mark Spencer <markster@digium.com>
  * \author Anthony Minessale II <anthmct@yahoo.com>
  * \author Tilghman Lesher <tilghman@digium.com>
@@ -34,7 +34,7 @@
  * \addtogroup configuration_file Configuration Files
  */
 
-/*! 
+/*!
  * \page res_odbc.conf res_odbc.conf
  * \verbinclude res_odbc.conf.sample
  */
@@ -42,13 +42,10 @@
 /*** MODULEINFO
 	<depend>generic_odbc</depend>
 	<depend>res_odbc_transaction</depend>
-	<depend>ltdl</depend>
 	<support_level>core</support_level>
  ***/
 
 #include "asterisk.h"
-
-ASTERISK_REGISTER_FILE()
 
 #include "asterisk/file.h"
 #include "asterisk/channel.h"
@@ -63,7 +60,6 @@ ASTERISK_REGISTER_FILE()
 #include "asterisk/app.h"
 #include "asterisk/strings.h"
 #include "asterisk/threadstorage.h"
-#include "asterisk/data.h"
 
 struct odbc_class
 {
@@ -120,15 +116,6 @@ struct odbc_txn_frame {
 	unsigned int isolation;         /*!< Flags for how the DB should deal with data in other, uncommitted transactions */
 	char name[0];                   /*!< Name of this transaction ID */
 };
-
-#define DATA_EXPORT_ODBC_CLASS(MEMBER)				\
-	MEMBER(odbc_class, name, AST_DATA_STRING)		\
-	MEMBER(odbc_class, dsn, AST_DATA_STRING)		\
-	MEMBER(odbc_class, username, AST_DATA_STRING)		\
-	MEMBER(odbc_class, password, AST_DATA_PASSWORD)		\
-	MEMBER(odbc_class, forcecommit, AST_DATA_BOOLEAN)
-
-AST_DATA_STRUCTURE(odbc_class, DATA_EXPORT_ODBC_CLASS);
 
 const char *ast_odbc_isolation2text(int iso)
 {
@@ -444,23 +431,20 @@ struct ast_str *ast_odbc_print_errors(SQLSMALLINT handle_type, SQLHANDLE handle,
 {
 	struct ast_str *errors = ast_str_thread_get(&errors_buf, 16);
 	SQLINTEGER nativeerror = 0;
-	SQLINTEGER numfields = 0;
 	SQLSMALLINT diagbytes = 0;
 	SQLSMALLINT i;
 	unsigned char state[10];
 	unsigned char diagnostic[256];
 
 	ast_str_reset(errors);
-	SQLGetDiagField(handle_type, handle, 1, SQL_DIAG_NUMBER, &numfields,
-			SQL_IS_INTEGER, &diagbytes);
-	for (i = 0; i < numfields; i++) {
-		SQLGetDiagRec(handle_type, handle, i + 1, state, &nativeerror,
-				diagnostic, sizeof(diagnostic), &diagbytes);
+	i = 0;
+	while (SQLGetDiagRec(handle_type, handle, ++i, state, &nativeerror,
+		diagnostic, sizeof(diagnostic), &diagbytes) == SQL_SUCCESS) {
 		ast_str_append(&errors, 0, "%s%s", ast_str_strlen(errors) ? "," : "", state);
 		ast_log(LOG_WARNING, "%s returned an error: %s: %s\n", operation, state, diagnostic);
 		/* XXX Why is this here? */
 		if (i > 10) {
-			ast_log(LOG_WARNING, "Oh, that was good.  There are really %d diagnostics?\n", (int)numfields);
+			ast_log(LOG_WARNING, "There are more than 10 diagnostic records! Ignore the rest.\n");
 			break;
 		}
 	}
@@ -523,7 +507,7 @@ static int load_odbc_config(void)
 						!strncasecmp(v->name, "share", 5) ||
 						!strcasecmp(v->name, "limit") ||
 						!strcasecmp(v->name, "idlecheck")) {
-					ast_log(LOG_WARNING, "The 'pooling', 'shared_connections', 'limit', and 'idlecheck' options are deprecated. Please see UPGRADE.txt for information\n");
+					ast_log(LOG_WARNING, "The 'pooling', 'shared_connections', 'limit', and 'idlecheck' options were replaced by 'max_connections'.  See res_odbc.conf.sample.\n");
 				} else if (!strcasecmp(v->name, "enabled")) {
 					enabled = ast_true(v->value);
 				} else if (!strcasecmp(v->name, "pre-connect")) {
@@ -973,65 +957,6 @@ static odbc_status odbc_obj_connect(struct odbc_obj *obj)
 	return ODBC_SUCCESS;
 }
 
-/*!
- * \internal
- * \brief Implements the channels provider.
- */
-static int data_odbc_provider_handler(const struct ast_data_search *search,
-		struct ast_data *root)
-{
-	struct ao2_iterator aoi;
-	struct odbc_class *class;
-	struct ast_data *data_odbc_class, *data_odbc_connections;
-	struct ast_data *enum_node;
-
-	aoi = ao2_iterator_init(class_container, 0);
-	while ((class = ao2_iterator_next(&aoi))) {
-		data_odbc_class = ast_data_add_node(root, "class");
-		if (!data_odbc_class) {
-			ao2_ref(class, -1);
-			continue;
-		}
-
-		ast_data_add_structure(odbc_class, data_odbc_class, class);
-
-		data_odbc_connections = ast_data_add_node(data_odbc_class, "connections");
-		if (!data_odbc_connections) {
-			ao2_ref(class, -1);
-			continue;
-		}
-
-		/* isolation */
-		enum_node = ast_data_add_node(data_odbc_class, "isolation");
-		if (!enum_node) {
-			ao2_ref(class, -1);
-			continue;
-		}
-		ast_data_add_int(enum_node, "value", class->isolation);
-		ast_data_add_str(enum_node, "text", ast_odbc_isolation2text(class->isolation));
-		ao2_ref(class, -1);
-
-		if (!ast_data_search_match(search, data_odbc_class)) {
-			ast_data_remove_node(root, data_odbc_class);
-		}
-	}
-	ao2_iterator_destroy(&aoi);
-	return 0;
-}
-
-/*!
- * \internal
- * \brief /asterisk/res/odbc/listprovider.
- */
-static const struct ast_data_handler odbc_provider = {
-	.version = AST_DATA_HANDLER_VERSION,
-	.get = data_odbc_provider_handler
-};
-
-static const struct ast_data_entry odbc_providers[] = {
-	AST_DATA_ENTRY("/asterisk/res/odbc", &odbc_provider),
-};
-
 static int reload(void)
 {
 	struct odbc_cache_tables *table;
@@ -1068,30 +993,26 @@ static int reload(void)
 
 static int unload_module(void)
 {
-	/* Prohibit unloading */
-	return -1;
+	ao2_cleanup(class_container);
+	ast_cli_unregister_multiple(cli_odbc, ARRAY_LEN(cli_odbc));
+
+	return 0;
 }
 
-/*!
- * \brief Load the module
- *
- * Module loading including tests for configuration or dependencies.
- * This function can return AST_MODULE_LOAD_FAILURE, AST_MODULE_LOAD_DECLINE,
- * or AST_MODULE_LOAD_SUCCESS. If a dependency or environment variable fails
- * tests return AST_MODULE_LOAD_FAILURE. If the module can not load the 
- * configuration file or other non-critical problem return 
- * AST_MODULE_LOAD_DECLINE. On success return AST_MODULE_LOAD_SUCCESS.
- */
 static int load_module(void)
 {
-	if (!(class_container = ao2_container_alloc(1, null_hash_fn, ao2_match_by_addr)))
+	if (!(class_container = ao2_container_alloc(1, null_hash_fn, ao2_match_by_addr))) {
 		return AST_MODULE_LOAD_DECLINE;
-	if (load_odbc_config() == -1)
+	}
+
+	if (load_odbc_config() == -1) {
 		return AST_MODULE_LOAD_DECLINE;
+	}
+
+	ast_module_shutdown_ref(ast_module_info->self);
 	ast_cli_register_multiple(cli_odbc, ARRAY_LEN(cli_odbc));
-	ast_data_register_multiple(odbc_providers, ARRAY_LEN(odbc_providers));
-	ast_log(LOG_NOTICE, "res_odbc loaded.\n");
-	return 0;
+
+	return AST_MODULE_LOAD_SUCCESS;
 }
 
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_ORDER, "ODBC resource",

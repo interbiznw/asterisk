@@ -29,8 +29,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/_private.h"
 #include "asterisk/paths.h"	/* use ast_config_AST_SYSTEM_NAME */
 #include <ctype.h>
@@ -253,6 +251,8 @@ struct ast_exten {
 	struct ast_hashtab *peer_table;    /*!< Priorities list in hashtab form -- only on the head of the peer list */
 	struct ast_hashtab *peer_label_table; /*!< labeled priorities in the peers -- only on the head of the peer list */
 	const char *registrar;		/*!< Registrar */
+	const char *registrar_file;     /*!< File name used to register extension */
+	int registrar_line;             /*!< Line number the extension was registered in text */
 	struct ast_exten *next;		/*!< Extension with a greater ID */
 	char stuff[0];
 };
@@ -652,11 +652,12 @@ static int ast_add_extension_nolock(const char *context, int replace, const char
 static int ast_add_extension2_lockopt(struct ast_context *con,
 	int replace, const char *extension, int priority, const char *label, const char *callerid,
 	const char *application, void *data, void (*datad)(void *),
-	const char *registrar, int lock_context);
+	const char *registrar, const char *registrar_file, int registrar_line,
+	int lock_context);
 static struct ast_context *find_context_locked(const char *context);
 static struct ast_context *find_context(const char *context);
 static void get_device_state_causing_channels(struct ao2_container *c);
-static int ext_strncpy(char *dst, const char *src, int len, int nofluff);
+static unsigned int ext_strncpy(char *dst, const char *src, size_t dst_size, int nofluff);
 
 /*!
  * \internal
@@ -2862,7 +2863,6 @@ static int pbx_extension_helper(struct ast_channel *c, struct ast_context *con,
 	struct ast_exten *e;
 	struct ast_app *app;
 	char *substitute = NULL;
-	int res;
 	struct pbx_find_info q = { .stacklen = 0 }; /* the rest is reset in pbx_find_extension */
 	char passdata[EXT_DATA_SIZE];
 	int matching_action = (action == E_MATCH || action == E_CANMATCH || action == E_MATCHMORE);
@@ -2879,9 +2879,12 @@ static int pbx_extension_helper(struct ast_channel *c, struct ast_context *con,
 			ast_unlock_contexts();
 			return -1;	/* success, we found it */
 		} else if (action == E_FINDLABEL) { /* map the label to a priority */
-			res = e->priority;
+			int res = e->priority;
+
 			ast_unlock_contexts();
-			return res;	/* the priority we were looking for */
+
+			/* the priority we were looking for */
+			return res;
 		} else {	/* spawn */
 			if (!e->cached_app)
 				e->cached_app = pbx_findapp(e->app);
@@ -2931,7 +2934,7 @@ static int pbx_extension_helper(struct ast_channel *c, struct ast_context *con,
 		} else {
 			if (!q.swo->exec) {
 				ast_log(LOG_WARNING, "No execution engine for switch %s\n", q.swo->name);
-				res = -1;
+				return -1;
 			}
 			return q.swo->exec(c, q.foundcontext ? q.foundcontext : context, exten, priority, callerid, q.data);
 		}
@@ -3051,7 +3054,7 @@ static void device_state_info_dt(void *obj)
 
 static struct ao2_container *alloc_device_state_info(void)
 {
-	return ao2_container_alloc_options(AO2_ALLOC_OPT_LOCK_NOLOCK, 1, NULL, NULL);
+	return ao2_container_alloc_list(AO2_ALLOC_OPT_LOCK_NOLOCK, 0, NULL, NULL);
 }
 
 static int ast_extension_state3(struct ast_str *hint_app, struct ao2_container *device_state_info)
@@ -3966,7 +3969,6 @@ static int ast_add_hint(struct ast_exten *e)
 			hint_new->last_presence_state = presence_state;
 			hint_new->last_presence_subtype = subtype;
 			hint_new->last_presence_message = message;
-			message = subtype = NULL;
 		}
 	}
 
@@ -4300,8 +4302,10 @@ static enum ast_pbx_result __ast_pbx_run(struct ast_channel *c,
 	ast_channel_pbx(c)->rtimeoutms = 10000;
 	ast_channel_pbx(c)->dtimeoutms = 5000;
 
+	ast_channel_lock(c);
 	autoloopflag = ast_test_flag(ast_channel_flags(c), AST_FLAG_IN_AUTOLOOP);	/* save value to restore at the end */
 	ast_set_flag(ast_channel_flags(c), AST_FLAG_IN_AUTOLOOP);
+	ast_channel_unlock(c);
 
 	if (ast_strlen_zero(ast_channel_exten(c))) {
 		/* If not successful fall back to 's' - but only if there is no given exten  */
@@ -4546,8 +4550,10 @@ static enum ast_pbx_result __ast_pbx_run(struct ast_channel *c,
 		ast_pbx_hangup_handler_run(c);
 	}
 
+	ast_channel_lock(c);
 	ast_set2_flag(ast_channel_flags(c), autoloopflag, AST_FLAG_IN_AUTOLOOP);
 	ast_clear_flag(ast_channel_flags(c), AST_FLAG_BRIDGE_HANGUP_RUN); /* from one round to the next, make sure this gets cleared */
+	ast_channel_unlock(c);
 	pbx_destroy(ast_channel_pbx(c));
 	ast_channel_pbx_set(c, NULL);
 
@@ -5294,8 +5300,8 @@ static char *handle_show_hint(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "%-20.20s: %-20.20s  State:%-15.15s Presence:%-15.15s Watchers %2d\n",
 				buf,
 				ast_get_extension_app(hint->exten),
-				ast_extension_state2str(hint->laststate), 
-				ast_presence_state2str(hint->last_presence_state), 
+				ast_extension_state2str(hint->laststate),
+				ast_presence_state2str(hint->last_presence_state),
 				watchers);
 			num++;
 		}
@@ -5440,6 +5446,21 @@ static void print_ext(struct ast_exten *e, char * buf, int buflen)
 	}
 }
 
+/*! \brief Writes CLI output of a single extension for show dialplan */
+static void show_dialplan_helper_extension_output(int fd, char *buf1, char *buf2, struct ast_exten *exten)
+{
+	if (ast_get_extension_registrar_file(exten)) {
+		ast_cli(fd, "  %-17s %-45s [%s:%d]\n",
+			buf1, buf2,
+			ast_get_extension_registrar_file(exten),
+			ast_get_extension_registrar_line(exten));
+		return;
+	}
+
+	ast_cli(fd, "  %-17s %-45s [%s]\n",
+		buf1, buf2, ast_get_extension_registrar(exten));
+}
+
 /* XXX not verified */
 static int show_dialplan_helper(int fd, const char *context, const char *exten, struct dialplan_counters *dpc, const struct ast_include *rinclude, int includecount, const char *includes[])
 {
@@ -5517,8 +5538,7 @@ static int show_dialplan_helper(int fd, const char *context, const char *exten, 
 
 			print_ext(e, buf2, sizeof(buf2));
 
-			ast_cli(fd, "  %-17s %-45s [%s]\n", buf, buf2,
-				ast_get_extension_registrar(e));
+			show_dialplan_helper_extension_output(fd, buf, buf2, e);
 
 			dpc->total_exten++;
 			/* walk next extension peers */
@@ -5532,8 +5552,7 @@ static int show_dialplan_helper(int fd, const char *context, const char *exten, 
 					buf[0] = '\0';
 				print_ext(p, buf2, sizeof(buf2));
 
-				ast_cli(fd,"  %-17s %-45s [%s]\n", buf, buf2,
-					ast_get_extension_registrar(p));
+				show_dialplan_helper_extension_output(fd, buf, buf2, p);
 			}
 		}
 
@@ -6188,15 +6207,14 @@ struct ast_context *ast_context_find_or_create(struct ast_context **extcontexts,
 		*local_contexts = tmp;
 		ast_hashtab_insert_safe(contexts_table, tmp); /*put this context into the tree */
 		ast_unlock_contexts();
-		ast_verb(3, "Registered extension context '%s'; registrar: %s\n", tmp->name, registrar);
 	} else {
 		tmp->next = *local_contexts;
 		if (exttable)
 			ast_hashtab_insert_immediate(exttable, tmp); /*put this context into the tree */
 
 		*local_contexts = tmp;
-		ast_verb(3, "Registered extension context '%s'; registrar: %s\n", tmp->name, registrar);
 	}
+	ast_debug(1, "Registered extension context '%s'; registrar: %s\n", tmp->name, registrar);
 	return tmp;
 }
 
@@ -6217,7 +6235,7 @@ struct store_hint {
 	char *last_presence_message;
 
 	AST_LIST_ENTRY(store_hint) list;
-	char data[1];
+	char data[0];
 };
 
 AST_LIST_HEAD_NOLOCK(store_hints, store_hint);
@@ -6226,7 +6244,7 @@ static void context_merge_incls_swits_igps_other_registrars(struct ast_context *
 {
 	int idx;
 
-	ast_verb(3, "merging incls/swits/igpats from old(%s) to new(%s) context, registrar = %s\n", ast_get_context_name(old), ast_get_context_name(new), registrar);
+	ast_debug(1, "merging incls/swits/igpats from old(%s) to new(%s) context, registrar = %s\n", ast_get_context_name(old), ast_get_context_name(new), registrar);
 	/* copy in the includes, switches, and ignorepats */
 	/* walk through includes */
 	for (idx = 0; idx < ast_context_includes_count(old); idx++) {
@@ -6358,7 +6376,8 @@ static void context_merge(struct ast_context **extcontexts, struct ast_hashtab *
 				dupdstr = ast_strdup(prio_item->data);
 
 				res1 = ast_add_extension2(new, 0, prio_item->name, prio_item->priority, prio_item->label,
-										  prio_item->matchcid ? prio_item->cidmatch : NULL, prio_item->app, dupdstr, ast_free_ptr, prio_item->registrar);
+										  prio_item->matchcid ? prio_item->cidmatch : NULL, prio_item->app, dupdstr, ast_free_ptr, prio_item->registrar,
+										  prio_item->registrar_file, prio_item->registrar_line);
 				if (!res1 && new_exten_item && new_prio_item){
 					ast_verb(3,"Dropping old dialplan item %s/%s/%d [%s(%s)] (registrar=%s) due to conflict with new dialplan\n",
 							context->name, prio_item->name, prio_item->priority, prio_item->app, (char*)prio_item->data, prio_item->registrar);
@@ -6410,6 +6429,7 @@ void ast_merge_contexts_and_delete(struct ast_context **extcontexts, struct ast_
 	struct ast_state_cb *thiscb;
 	struct ast_hashtab_iter *iter;
 	struct ao2_iterator i;
+	int ctx_count = 0;
 	struct timeval begintime;
 	struct timeval writelocktime;
 	struct timeval endlocktime;
@@ -6445,6 +6465,7 @@ void ast_merge_contexts_and_delete(struct ast_context **extcontexts, struct ast_
 
 	iter = ast_hashtab_start_traversal(contexts_table);
 	while ((tmp = ast_hashtab_next(iter))) {
+		++ctx_count;
 		context_merge(extcontexts, exttable, tmp, registrar);
 	}
 	ast_hashtab_end_traversal(iter);
@@ -6620,6 +6641,7 @@ void ast_merge_contexts_and_delete(struct ast_context **extcontexts, struct ast_
 	ft = ast_tvdiff_us(enddeltime, begintime);
 	ft /= 1000000.0;
 	ast_verb(3,"Total time merge_contexts_delete: %8.6f sec\n", ft);
+	ast_verb(3, "%s successfully loaded %d contexts (enable debug for details).\n", registrar, ctx_count);
 }
 
 /*
@@ -6674,8 +6696,12 @@ int ast_context_add_include2(struct ast_context *con, const char *value,
 	}
 
 	/* ... include new context into context list, unlock, return */
-	AST_VECTOR_APPEND(&con->includes, new_include);
-	ast_verb(3, "Including context '%s' in context '%s'\n",
+	if (AST_VECTOR_APPEND(&con->includes, new_include)) {
+		include_free(new_include);
+		ast_unlock_context(con);
+		return -1;
+	}
+	ast_debug(1, "Including context '%s' in context '%s'\n",
 		ast_get_include_name(new_include), ast_get_context_name(con));
 
 	ast_unlock_context(con);
@@ -6736,7 +6762,11 @@ int ast_context_add_switch2(struct ast_context *con, const char *value,
 	}
 
 	/* ... sw new context into context list, unlock, return */
-	AST_VECTOR_APPEND(&con->alts, new_sw);
+	if (AST_VECTOR_APPEND(&con->alts, new_sw)) {
+		sw_free(new_sw);
+		ast_unlock_context(con);
+		return -1;
+	}
 
 	ast_verb(3, "Including switch '%s/%s' in context '%s'\n",
 		ast_get_switch_name(new_sw), ast_get_switch_data(new_sw), ast_get_context_name(con));
@@ -6824,7 +6854,11 @@ int ast_context_add_ignorepat2(struct ast_context *con, const char *value, const
 			return -1;
 		}
 	}
-	AST_VECTOR_APPEND(&con->ignorepats, ignorepat);
+	if (AST_VECTOR_APPEND(&con->ignorepats, ignorepat)) {
+		ignorepat_free(ignorepat);
+		ast_unlock_context(con);
+		return -1;
+	}
 	ast_unlock_context(con);
 
 	return 0;
@@ -6869,7 +6903,7 @@ static int ast_add_extension_nolock(const char *context, int replace, const char
 	c = find_context(context);
 	if (c) {
 		ret = ast_add_extension2_lockopt(c, replace, extension, priority, label, callerid,
-			application, data, datad, registrar, 1);
+			application, data, datad, registrar, NULL, 0, 1);
 	}
 
 	return ret;
@@ -6889,7 +6923,7 @@ int ast_add_extension(const char *context, int replace, const char *extension,
 	c = find_context_locked(context);
 	if (c) {
 		ret = ast_add_extension2(c, replace, extension, priority, label, callerid,
-			application, data, datad, registrar);
+			application, data, datad, registrar, NULL, 0);
 		ast_unlock_contexts();
 	}
 
@@ -6966,32 +7000,51 @@ int ast_async_goto_by_name(const char *channame, const char *context, const char
 	return res;
 }
 
-/*! \brief copy a string skipping whitespace and dashes */
-static int ext_strncpy(char *dst, const char *src, int len, int nofluff)
+/*!
+ * \internal
+ * \brief Copy a string skipping whitespace and optionally dashes.
+ *
+ * \param dst Destination buffer to copy src string.
+ * \param src Null terminated string to copy.
+ * \param dst_size Number of bytes in the dst buffer.
+ * \param nofluf Nonzero if '-' chars are not copied.
+ *
+ * \return Number of bytes written to dst including null terminator.
+ */
+static unsigned int ext_strncpy(char *dst, const char *src, size_t dst_size, int nofluff)
 {
-	int count = 0;
-	int insquares = 0;
+	unsigned int count;
+	unsigned int insquares;
+	unsigned int is_pattern;
 
-	while (*src && (count < len - 1)) {
+	if (!dst_size--) {
+		/* There really is no dst buffer */
+		return 0;
+	}
+
+	count = 0;
+	insquares = 0;
+	is_pattern = *src == '_';
+	while (*src && count < dst_size) {
 		if (*src == '[') {
-			insquares = 1;
+			if (is_pattern) {
+				insquares = 1;
+			}
 		} else if (*src == ']') {
 			insquares = 0;
 		} else if (*src == ' ' && !insquares) {
-			src++;
+			++src;
 			continue;
 		} else if (*src == '-' && !insquares && nofluff) {
-			src++;
+			++src;
 			continue;
 		}
-		*dst = *src;
-		dst++;
-		src++;
-		count++;
+		*dst++ = *src++;
+		++count;
 	}
 	*dst = '\0';
 
-	return count;
+	return count + 1;
 }
 
 /*!
@@ -7192,19 +7245,19 @@ static int add_priority(struct ast_context *con, struct ast_exten *tmp,
 int ast_add_extension2(struct ast_context *con,
 	int replace, const char *extension, int priority, const char *label, const char *callerid,
 	const char *application, void *data, void (*datad)(void *),
-	const char *registrar)
+	const char *registrar, const char *registrar_file, int registrar_line)
 {
 	return ast_add_extension2_lockopt(con, replace, extension, priority, label, callerid,
-		application, data, datad, registrar, 1);
+		application, data, datad, registrar, registrar_file, registrar_line, 1);
 }
 
 int ast_add_extension2_nolock(struct ast_context *con,
 	int replace, const char *extension, int priority, const char *label, const char *callerid,
 	const char *application, void *data, void (*datad)(void *),
-	const char *registrar)
+	const char *registrar, const char *registrar_file, int registrar_line)
 {
 	return ast_add_extension2_lockopt(con, replace, extension, priority, label, callerid,
-		application, data, datad, registrar, 0);
+		application, data, datad, registrar, registrar_file, registrar_line, 0);
 }
 
 
@@ -7218,7 +7271,7 @@ int ast_add_extension2_nolock(struct ast_context *con,
 static int ast_add_extension2_lockopt(struct ast_context *con,
 	int replace, const char *extension, int priority, const char *label, const char *callerid,
 	const char *application, void *data, void (*datad)(void *),
-	const char *registrar, int lock_context)
+	const char *registrar, const char *registrar_file, int registrar_line, int lock_context)
 {
 	/*
 	 * Sort extensions (or patterns) according to the rules indicated above.
@@ -7289,6 +7342,9 @@ static int ast_add_extension2_lockopt(struct ast_context *con,
 	} else {
 		length ++;	/* just the '\0' */
 	}
+	if (registrar_file) {
+		length += strlen(registrar_file) + 1;
+	}
 
 	/* Be optimistic:  Build the extension structure first */
 	if (!(tmp = ast_calloc(1, length)))
@@ -7305,10 +7361,10 @@ static int ast_add_extension2_lockopt(struct ast_context *con,
 		p += strlen(label) + 1;
 	}
 	tmp->name = p;
-	p += ext_strncpy(p, extension, strlen(extension) + 1, 0) + 1;
+	p += ext_strncpy(p, extension, strlen(extension) + 1, 0);
 	if (exten_fluff) {
 		tmp->exten = p;
-		p += ext_strncpy(p, extension, strlen(extension) + 1, 1) + 1;
+		p += ext_strncpy(p, extension, strlen(extension) + 1 - exten_fluff, 1);
 	} else {
 		/* no fluff, we don't need a copy. */
 		tmp->exten = tmp->name;
@@ -7318,22 +7374,32 @@ static int ast_add_extension2_lockopt(struct ast_context *con,
 
 	/* Blank callerid and NULL callerid are two SEPARATE things.  Do NOT confuse the two!!! */
 	if (callerid) {
-		p += ext_strncpy(p, callerid, strlen(callerid) + 1, 0) + 1;
+		p += ext_strncpy(p, callerid, strlen(callerid) + 1, 0);
 		if (callerid_fluff) {
 			tmp->cidmatch = p;
-			p += ext_strncpy(p, callerid, strlen(callerid) + 1, 1) + 1;
+			p += ext_strncpy(p, callerid, strlen(callerid) + 1 - callerid_fluff, 1);
 		}
 		tmp->matchcid = AST_EXT_MATCHCID_ON;
 	} else {
 		*p++ = '\0';
 		tmp->matchcid = AST_EXT_MATCHCID_OFF;
 	}
+
+	if (registrar_file) {
+		tmp->registrar_file = p;
+		strcpy(p, registrar_file);
+		p += strlen(registrar_file) + 1;
+	} else {
+		tmp->registrar_file = NULL;
+	}
+
 	tmp->app = p;
 	strcpy(p, application);
 	tmp->parent = con;
 	tmp->data = data;
 	tmp->datad = datad;
 	tmp->registrar = registrar;
+	tmp->registrar_line = registrar_line;
 
 	if (lock_context) {
 		ast_wrlock_context(con);
@@ -7442,22 +7508,14 @@ static int ast_add_extension2_lockopt(struct ast_context *con,
 			ast_add_hint(tmp);
 		}
 	}
-	if (option_debug) {
+	if (DEBUG_ATLEAST(1)) {
 		if (tmp->matchcid == AST_EXT_MATCHCID_ON) {
-			ast_debug(1, "Added extension '%s' priority %d (CID match '%s') to %s (%p)\n",
-					  tmp->name, tmp->priority, tmp->cidmatch_display, con->name, con);
+			ast_log(LOG_DEBUG, "Added extension '%s' priority %d (CID match '%s') to %s (%p)\n",
+				tmp->name, tmp->priority, tmp->cidmatch_display, con->name, con);
 		} else {
-			ast_debug(1, "Added extension '%s' priority %d to %s (%p)\n",
-					  tmp->name, tmp->priority, con->name, con);
+			ast_log(LOG_DEBUG, "Added extension '%s' priority %d to %s (%p)\n",
+				tmp->name, tmp->priority, con->name, con);
 		}
-	}
-
-	if (tmp->matchcid == AST_EXT_MATCHCID_ON) {
-		ast_verb(3, "Added extension '%s' priority %d (CID match '%s') to %s\n",
-				 tmp->name, tmp->priority, tmp->cidmatch_display, con->name);
-	} else {
-		ast_verb(3, "Added extension '%s' priority %d to %s\n",
-				 tmp->name, tmp->priority, con->name);
 	}
 
 	return 0;
@@ -7483,8 +7541,8 @@ struct pbx_outgoing {
 	int dial_res;
 	/*! \brief Set when dialing is completed */
 	unsigned int dialed:1;
-	/*! \brief Set when execution is completed */
-	unsigned int executed:1;
+	/*! \brief Set if we've spawned a thread to do our work */
+	unsigned int in_separate_thread:1;
 };
 
 /*! \brief Destructor for outgoing structure */
@@ -7507,13 +7565,19 @@ static void *pbx_outgoing_exec(void *data)
 	RAII_VAR(struct pbx_outgoing *, outgoing, data, ao2_cleanup);
 	enum ast_dial_result res;
 
-	/* Notify anyone interested that dialing is complete */
 	res = ast_dial_run(outgoing->dial, NULL, 0);
-	ao2_lock(outgoing);
-	outgoing->dial_res = res;
-	outgoing->dialed = 1;
-	ast_cond_signal(&outgoing->cond);
-	ao2_unlock(outgoing);
+
+	if (outgoing->in_separate_thread) {
+		/* Notify anyone interested that dialing is complete */
+		ao2_lock(outgoing);
+		outgoing->dial_res = res;
+		outgoing->dialed = 1;
+		ast_cond_signal(&outgoing->cond);
+		ao2_unlock(outgoing);
+	} else {
+		/* We still need the dial result, but we don't need to lock */
+		outgoing->dial_res = res;
+	}
 
 	/* If the outgoing leg was not answered we can immediately return and go no further */
 	if (res != AST_DIAL_RESULT_ANSWERED) {
@@ -7552,12 +7616,6 @@ static void *pbx_outgoing_exec(void *data)
 			ast_dial_answered_steal(outgoing->dial);
 		}
 	}
-
-	/* Notify anyone else again that may be interested that execution is complete */
-	ao2_lock(outgoing);
-	outgoing->executed = 1;
-	ast_cond_signal(&outgoing->cond);
-	ao2_unlock(outgoing);
 
 	return NULL;
 }
@@ -7633,11 +7691,13 @@ static int pbx_outgoing_attempt(const char *type, struct ast_format_cap *cap,
 	const char *app, const char *appdata, int *reason, int synchronous,
 	const char *cid_num, const char *cid_name, struct ast_variable *vars,
 	const char *account, struct ast_channel **locked_channel, int early_media,
-	const struct ast_assigned_ids *assignedids)
+	const struct ast_assigned_ids *assignedids, const char *predial_callee)
 {
 	RAII_VAR(struct pbx_outgoing *, outgoing, NULL, ao2_cleanup);
 	struct ast_channel *dialed;
 	pthread_t thread;
+	char tmp_cid_name[128];
+	char tmp_cid_num[128];
 
 	outgoing = ao2_alloc(sizeof(*outgoing), pbx_outgoing_destroy);
 	if (!outgoing) {
@@ -7664,6 +7724,11 @@ static int pbx_outgoing_attempt(const char *type, struct ast_format_cap *cap,
 
 	ast_dial_set_global_timeout(outgoing->dial, timeout);
 
+	if (!ast_strlen_zero(predial_callee)) {
+		/* note casting to void * here to suppress compiler warning message (passing const to non-const function) */
+		ast_dial_option_global_enable(outgoing->dial, AST_DIAL_OPTION_PREDIAL, (void *)predial_callee);
+	}
+
 	if (ast_dial_prerun(outgoing->dial, NULL, cap)) {
 		if (synchronous && reason) {
 			*reason = pbx_dial_reason(AST_DIAL_RESULT_FAILED,
@@ -7688,6 +7753,25 @@ static int pbx_outgoing_attempt(const char *type, struct ast_format_cap *cap,
 		ast_channel_stage_snapshot_done(dialed);
 	}
 	ast_set_flag(ast_channel_flags(dialed), AST_FLAG_ORIGINATED);
+
+	if (!ast_strlen_zero(predial_callee)) {
+		char *tmp = NULL;
+		/*
+		 * The predial sub routine may have set callerid so set this into the new channel
+		 * Note... cid_num and cid_name parameters to this function will always be NULL if
+		 * predial_callee is non-NULL so we are not overwriting anything here.
+		 */
+		tmp = S_COR(ast_channel_caller(dialed)->id.number.valid, ast_channel_caller(dialed)->id.number.str, NULL);
+		if (tmp) {
+			ast_copy_string(tmp_cid_num, tmp, sizeof(tmp_cid_num));
+			cid_num = tmp_cid_num;
+		}
+		tmp = S_COR(ast_channel_caller(dialed)->id.name.valid, ast_channel_caller(dialed)->id.name.str, NULL);
+		if (tmp) {
+			ast_copy_string(tmp_cid_name, tmp, sizeof(tmp_cid_name));
+			cid_name = tmp_cid_name;
+		}
+	}
 	ast_channel_unlock(dialed);
 
 	if (!ast_strlen_zero(cid_num) || !ast_strlen_zero(cid_name)) {
@@ -7738,34 +7822,42 @@ static int pbx_outgoing_attempt(const char *type, struct ast_format_cap *cap,
 		}
 	}
 
+	/* This extra reference is dereferenced by pbx_outgoing_exec */
 	ao2_ref(outgoing, +1);
-	if (ast_pthread_create_detached(&thread, NULL, pbx_outgoing_exec, outgoing)) {
-		ast_log(LOG_WARNING, "Unable to spawn dialing thread for '%s/%s'\n", type, addr);
-		ao2_ref(outgoing, -1);
-		if (locked_channel) {
-			if (!synchronous) {
-				ast_channel_unlock(dialed);
+
+	if (synchronous == AST_OUTGOING_WAIT_COMPLETE) {
+		/*
+		 * Because we are waiting until this is complete anyway, there is no
+		 * sense in creating another thread that we will just need to wait
+		 * for, so instead we commandeer the current thread.
+		 */
+		pbx_outgoing_exec(outgoing);
+	} else {
+		outgoing->in_separate_thread = 1;
+
+		if (ast_pthread_create_detached(&thread, NULL, pbx_outgoing_exec, outgoing)) {
+			ast_log(LOG_WARNING, "Unable to spawn dialing thread for '%s/%s'\n", type, addr);
+			ao2_ref(outgoing, -1);
+			if (locked_channel) {
+				if (!synchronous) {
+					ast_channel_unlock(dialed);
+				}
+				ast_channel_unref(dialed);
 			}
-			ast_channel_unref(dialed);
+			return -1;
 		}
-		return -1;
+
+		if (synchronous) {
+			ao2_lock(outgoing);
+			/* Wait for dialing to complete */
+			while (!outgoing->dialed) {
+				ast_cond_wait(&outgoing->cond, ao2_object_get_lockaddr(outgoing));
+			}
+			ao2_unlock(outgoing);
+		}
 	}
 
 	if (synchronous) {
-		ao2_lock(outgoing);
-		/* Wait for dialing to complete */
-		while (!outgoing->dialed) {
-			ast_cond_wait(&outgoing->cond, ao2_object_get_lockaddr(outgoing));
-		}
-		if (1 < synchronous
-			&& outgoing->dial_res == AST_DIAL_RESULT_ANSWERED) {
-			/* Wait for execution to complete */
-			while (!outgoing->executed) {
-				ast_cond_wait(&outgoing->cond, ao2_object_get_lockaddr(outgoing));
-			}
-		}
-		ao2_unlock(outgoing);
-
 		/* Determine the outcome of the dialing attempt up to it being answered. */
 		if (reason) {
 			*reason = pbx_dial_reason(outgoing->dial_res,
@@ -7796,6 +7888,16 @@ int ast_pbx_outgoing_exten(const char *type, struct ast_format_cap *cap, const c
 	const char *account, struct ast_channel **locked_channel, int early_media,
 	const struct ast_assigned_ids *assignedids)
 {
+	return ast_pbx_outgoing_exten_predial(type, cap, addr, timeout, context, exten, priority, reason,
+		synchronous, cid_num, cid_name, vars, account, locked_channel, early_media, assignedids, NULL);
+}
+
+int ast_pbx_outgoing_exten_predial(const char *type, struct ast_format_cap *cap, const char *addr,
+	int timeout, const char *context, const char *exten, int priority, int *reason,
+	int synchronous, const char *cid_num, const char *cid_name, struct ast_variable *vars,
+	const char *account, struct ast_channel **locked_channel, int early_media,
+	const struct ast_assigned_ids *assignedids, const char *predial_callee)
+{
 	int res;
 	int my_reason;
 
@@ -7809,10 +7911,10 @@ int ast_pbx_outgoing_exten(const char *type, struct ast_format_cap *cap, const c
 
 	res = pbx_outgoing_attempt(type, cap, addr, timeout, context, exten, priority,
 		NULL, NULL, reason, synchronous, cid_num, cid_name, vars, account, locked_channel,
-		early_media, assignedids);
+		early_media, assignedids, predial_callee);
 
 	if (res < 0 /* Call failed to get connected for some reason. */
-		&& 1 < synchronous
+		&& 0 < synchronous
 		&& ast_exists_extension(NULL, context, "failed", 1, NULL)) {
 		struct ast_channel *failed;
 
@@ -7850,6 +7952,16 @@ int ast_pbx_outgoing_app(const char *type, struct ast_format_cap *cap, const cha
 	const char *account, struct ast_channel **locked_channel,
 	const struct ast_assigned_ids *assignedids)
 {
+	return ast_pbx_outgoing_app_predial(type, cap, addr, timeout, app, appdata, reason, synchronous,
+		cid_num, cid_name, vars, account, locked_channel, assignedids, NULL);
+}
+
+int ast_pbx_outgoing_app_predial(const char *type, struct ast_format_cap *cap, const char *addr,
+	int timeout, const char *app, const char *appdata, int *reason, int synchronous,
+	const char *cid_num, const char *cid_name, struct ast_variable *vars,
+	const char *account, struct ast_channel **locked_channel,
+	const struct ast_assigned_ids *assignedids, const char *predial_callee)
+{
 	if (reason) {
 		*reason = 0;
 	}
@@ -7862,7 +7974,7 @@ int ast_pbx_outgoing_app(const char *type, struct ast_format_cap *cap, const cha
 
 	return pbx_outgoing_attempt(type, cap, addr, timeout, NULL, NULL, 0, app, appdata,
 		reason, synchronous, cid_num, cid_name, vars, account, locked_channel, 0,
-		assignedids);
+		assignedids, predial_callee);
 }
 
 /* this is the guts of destroying a context --
@@ -8202,56 +8314,6 @@ static void presence_state_cb(void *unused, struct stasis_subscription *sub, str
 	ast_free(hint_app);
 }
 
-/*!
- * \internal
- * \brief Implements the hints data provider.
- */
-static int hints_data_provider_get(const struct ast_data_search *search,
-	struct ast_data *data_root)
-{
-	struct ast_data *data_hint;
-	struct ast_hint *hint;
-	int watchers;
-	struct ao2_iterator i;
-
-	if (ao2_container_count(hints) == 0) {
-		return 0;
-	}
-
-	i = ao2_iterator_init(hints, 0);
-	for (; (hint = ao2_iterator_next(&i)); ao2_ref(hint, -1)) {
-		watchers = ao2_container_count(hint->callbacks);
-		data_hint = ast_data_add_node(data_root, "hint");
-		if (!data_hint) {
-			continue;
-		}
-		ast_data_add_str(data_hint, "extension", ast_get_extension_name(hint->exten));
-		ast_data_add_str(data_hint, "context", ast_get_context_name(ast_get_extension_context(hint->exten)));
-		ast_data_add_str(data_hint, "application", ast_get_extension_app(hint->exten));
-		ast_data_add_str(data_hint, "state", ast_extension_state2str(hint->laststate));
-		ast_data_add_str(data_hint, "presence_state", ast_presence_state2str(hint->last_presence_state));
-		ast_data_add_str(data_hint, "presence_subtype", S_OR(hint->last_presence_subtype, ""));
-		ast_data_add_str(data_hint, "presence_subtype", S_OR(hint->last_presence_message, ""));
-		ast_data_add_int(data_hint, "watchers", watchers);
-
-		if (!ast_data_search_match(search, data_hint)) {
-			ast_data_remove_node(data_root, data_hint);
-		}
-	}
-	ao2_iterator_destroy(&i);
-
-	return 0;
-}
-
-static const struct ast_data_handler hints_data_provider = {
-	.version = AST_DATA_HANDLER_VERSION,
-	.get = hints_data_provider_get
-};
-
-static const struct ast_data_entry pbx_data_providers[] = {
-	AST_DATA_ENTRY("asterisk/core/hints", &hints_data_provider),
-};
-
 static int action_extensionstatelist(struct mansession *s, const struct message *m)
 {
 	const char *action_id = astman_get_header(m, "ActionID");
@@ -8327,7 +8389,6 @@ static void unload_pbx(void)
 	ast_cli_unregister_multiple(pbx_cli, ARRAY_LEN(pbx_cli));
 	ast_custom_function_unregister(&exception_function);
 	ast_custom_function_unregister(&testtime_function);
-	ast_data_unregister(NULL);
 }
 
 int load_pbx(void)
@@ -8341,7 +8402,6 @@ int load_pbx(void)
 
 	ast_verb(2, "Registering builtin functions:\n");
 	ast_cli_register_multiple(pbx_cli, ARRAY_LEN(pbx_cli));
-	ast_data_register_multiple_core(pbx_data_providers, ARRAY_LEN(pbx_data_providers));
 	__ast_custom_function_register(&exception_function, NULL);
 	__ast_custom_function_register(&testtime_function, NULL);
 
@@ -8439,6 +8499,16 @@ const char *ast_get_context_registrar(struct ast_context *c)
 const char *ast_get_extension_registrar(struct ast_exten *e)
 {
 	return e ? e->registrar : NULL;
+}
+
+const char *ast_get_extension_registrar_file(struct ast_exten *e)
+{
+	return e ? e->registrar_file : NULL;
+}
+
+int ast_get_extension_registrar_line(struct ast_exten *e)
+{
+	return e ? e->registrar_line : 0;
 }
 
 int ast_get_extension_matchcid(struct ast_exten *e)
@@ -8846,9 +8916,9 @@ int ast_pbx_init(void)
 		ao2_container_register("hintdevices", hintdevices, print_hintdevices_key);
 	}
 	/* This is protected by the context_and_merge lock */
-	autohints = ao2_container_alloc_options(AO2_ALLOC_OPT_LOCK_NOLOCK, HASH_EXTENHINT_SIZE,
-		autohint_hash_cb, autohint_cmp);
-	if (hintdevices) {
+	autohints = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_NOLOCK, 0, HASH_EXTENHINT_SIZE,
+		autohint_hash_cb, NULL, autohint_cmp);
+	if (autohints) {
 		ao2_container_register("autohints", autohints, print_autohint_key);
 	}
 	statecbs = ao2_container_alloc(1, NULL, statecbs_cmp);

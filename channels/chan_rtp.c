@@ -28,12 +28,11 @@
  */
 
 /*** MODULEINFO
+	<depend>res_rtp_multicast</depend>
 	<support_level>core</support_level>
  ***/
 
 #include "asterisk.h"
-
-ASTERISK_REGISTER_FILE()
 
 #include "asterisk/channel.h"
 #include "asterisk/module.h"
@@ -119,6 +118,22 @@ static int rtp_hangup(struct ast_channel *ast)
 	return 0;
 }
 
+static struct ast_format *derive_format_from_cap(struct ast_format_cap *cap)
+{
+	struct ast_format *fmt = ast_format_cap_get_format(cap, 0);
+
+	if (ast_format_cap_count(cap) == 1 && fmt == ast_format_slin) {
+		/*
+		 * Because we have no SDP, we must use one of the static RTP payload
+		 * assignments. Signed linear @ 8kHz does not map, so if that is our
+		 * only capability, we force μ-law instead.
+		 */
+		fmt = ast_format_ulaw;
+	}
+
+	return fmt;
+}
+
 /*! \brief Function called when we should prepare to call the multicast destination */
 static struct ast_channel *multicast_rtp_request(const char *type, struct ast_format_cap *cap, const struct ast_assigned_ids *assignedids, const struct ast_channel *requestor, const char *data, int *cause)
 {
@@ -173,7 +188,7 @@ static struct ast_channel *multicast_rtp_request(const char *type, struct ast_fo
 
 	fmt = ast_multicast_rtp_options_get_format(mcast_options);
 	if (!fmt) {
-		fmt = ast_format_cap_get_format(cap, 0);
+		fmt = derive_format_from_cap(cap);
 	}
 	if (!fmt) {
 		ast_log(LOG_ERROR, "No codec available for sending RTP to '%s'\n",
@@ -300,7 +315,7 @@ static struct ast_channel *unicast_rtp_request(const char *type, struct ast_form
 			goto failure;
 		}
 	} else {
-		fmt = ast_format_cap_get_format(cap, 0);
+		fmt = derive_format_from_cap(cap);
 		if (!fmt) {
 			ast_log(LOG_ERROR, "No codec available for sending RTP to '%s'\n",
 				args.destination);
@@ -314,9 +329,14 @@ static struct ast_channel *unicast_rtp_request(const char *type, struct ast_form
 	}
 
 	engine_name = S_COR(ast_test_flag(&opts, OPT_RTP_ENGINE),
-		opt_args[OPT_ARG_RTP_ENGINE], NULL);
+		opt_args[OPT_ARG_RTP_ENGINE], "asterisk");
 
-	ast_ouraddrfor(&address, &local_address);
+	ast_sockaddr_copy(&local_address, &address);
+	if (ast_ouraddrfor(&address, &local_address)) {
+		ast_log(LOG_ERROR, "Could not get our address for sending media to '%s'\n",
+			args.destination);
+		goto failure;
+	}
 	instance = ast_rtp_instance_new(engine_name, NULL, &local_address, NULL);
 	if (!instance) {
 		ast_log(LOG_ERROR,
@@ -412,4 +432,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "RTP Media Channel",
 	.load = load_module,
 	.unload = unload_module,
 	.load_pri = AST_MODPRI_CHANNEL_DRIVER,
+	.requires = "res_rtp_multicast",
 );

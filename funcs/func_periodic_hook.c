@@ -35,8 +35,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/module.h"
 #include "asterisk/channel.h"
 #include "asterisk/pbx.h"
@@ -139,8 +137,6 @@ static void hook_datastore_destroy_callback(void *data)
 	ast_free(state->context);
 	ast_free(state->exten);
 	ast_free(state);
-
-	ast_module_unref(ast_module_info->self);
 }
 
 static const struct ast_datastore_info hook_datastore = {
@@ -183,8 +179,8 @@ static void *hook_launch_thread(void *data)
 	};
 
 	ast_pbx_outgoing_exten("Local", NULL, full_exten_name, 60,
-			arg->context, arg->exten, 1, NULL, 0, NULL, NULL, &chan_name_var,
-			NULL, NULL, 1, NULL);
+			arg->context, arg->exten, 1, NULL, AST_OUTGOING_NO_WAIT,
+			NULL, NULL, &chan_name_var, NULL, NULL, 1, NULL);
 
 	hook_thread_arg_destroy(arg);
 
@@ -307,7 +303,7 @@ static int init_hook(struct ast_channel *chan, const char *context, const char *
 	if (!(datastore = ast_datastore_alloc(&hook_datastore, uid))) {
 		return -1;
 	}
-	ast_module_ref(ast_module_info->self);
+
 	if (!(state = hook_state_alloc(context, exten, interval, hook_id))) {
 		ast_datastore_free(datastore);
 		return -1;
@@ -450,7 +446,8 @@ static int unload_module(void)
 {
 	ast_context_destroy(NULL, AST_MODULE);
 
-	return ast_custom_function_unregister(&hook_function);
+	ast_custom_function_unregister(&hook_function);
+	return 0;
 }
 
 static int load_module(void)
@@ -465,32 +462,36 @@ static int load_module(void)
 	/*
 	 * Based on a handy recipe from the Asterisk Cookbook.
 	 */
-	ast_add_extension(context_name, 1, exten_name, 1, "", "",
+	res = ast_add_extension(context_name, 1, exten_name, 1, "", "",
 			"Set", "EncodedChannel=${CUT(HOOK_CHANNEL,-,1-2)}",
 			NULL, AST_MODULE);
-	ast_add_extension(context_name, 1, exten_name, 2, "", "",
+	res |= ast_add_extension(context_name, 1, exten_name, 2, "", "",
 			"Set", "GROUP_NAME=${EncodedChannel}${HOOK_ID}",
 			NULL, AST_MODULE);
-	ast_add_extension(context_name, 1, exten_name, 3, "", "",
+	res |= ast_add_extension(context_name, 1, exten_name, 3, "", "",
 			"Set", "GROUP(periodic-hook)=${GROUP_NAME}",
 			NULL, AST_MODULE);
-	ast_add_extension(context_name, 1, exten_name, 4, "", "", "ExecIf",
+	res |= ast_add_extension(context_name, 1, exten_name, 4, "", "", "ExecIf",
 			"$[${GROUP_COUNT(${GROUP_NAME}@periodic-hook)} > 1]?Hangup()",
 			NULL, AST_MODULE);
-	ast_add_extension(context_name, 1, exten_name, 5, "", "",
+	res |= ast_add_extension(context_name, 1, exten_name, 5, "", "",
 			"Set", "ChannelToSpy=${URIDECODE(${EncodedChannel})}",
 			NULL, AST_MODULE);
-	ast_add_extension(context_name, 1, exten_name, 6, "", "",
+	res |= ast_add_extension(context_name, 1, exten_name, 6, "", "",
 			"ChanSpy", "${ChannelToSpy},qEB", NULL, AST_MODULE);
 
-	res = ast_add_extension(context_name, 1, beep_exten, 1, "", "",
+	res |= ast_add_extension(context_name, 1, beep_exten, 1, "", "",
 			"Answer", "", NULL, AST_MODULE);
 	res |= ast_add_extension(context_name, 1, beep_exten, 2, "", "",
 			"Playback", "beep", NULL, AST_MODULE);
 
-	res = ast_custom_function_register_escalating(&hook_function, AST_CFE_BOTH);
+	res |= ast_custom_function_register_escalating(&hook_function, AST_CFE_BOTH);
 
-	return res ? AST_MODULE_LOAD_DECLINE : AST_MODULE_LOAD_SUCCESS;
+	if (res) {
+		unload_module();
+		return AST_MODULE_LOAD_DECLINE;
+	}
+	return AST_MODULE_LOAD_SUCCESS;
 }
 
 int AST_OPTIONAL_API_NAME(ast_beep_start)(struct ast_channel *chan,

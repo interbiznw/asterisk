@@ -24,13 +24,10 @@
  */
 
 /*** MODULEINFO
-	<depend type="module">res_stasis_recording</depend>
 	<support_level>core</support_level>
  ***/
 
 #include "asterisk.h"
-
-ASTERISK_REGISTER_FILE()
 
 #include "asterisk/stasis_app_recording.h"
 #include "resource_recordings.h"

@@ -31,8 +31,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/res_hep.h"
 #include "asterisk/module.h"
 #include "asterisk/netsock2.h"
@@ -55,12 +53,22 @@ static char *assign_uuid(struct ast_json *json_channel)
 		return NULL;
 	}
 
-	if (uuid_type == HEP_UUID_TYPE_CALL_ID && ast_begins_with(channel_name, "PJSIP")) {
-		struct ast_channel *chan = ast_channel_get_by_name(channel_name);
+	if (uuid_type == HEP_UUID_TYPE_CALL_ID) {
+		struct ast_channel *chan = NULL;
 		char buf[128];
 
-		if (chan && !ast_func_read(chan, "CHANNEL(pjsip,call-id)", buf, sizeof(buf))) {
-			uuid = ast_strdup(buf);
+		if (ast_begins_with(channel_name, "PJSIP")) {
+			chan = ast_channel_get_by_name(channel_name);
+
+			if (chan && !ast_func_read(chan, "CHANNEL(pjsip,call-id)", buf, sizeof(buf))) {
+				uuid = ast_strdup(buf);
+			}
+		} else if (ast_begins_with(channel_name, "SIP")) {
+			chan = ast_channel_get_by_name(channel_name);
+
+			if (chan && !ast_func_read(chan, "SIP_HEADER(call-id)", buf, sizeof(buf))) {
+				uuid = ast_strdup(buf);
+			}
 		}
 
 		ast_channel_cleanup(chan);
@@ -149,15 +157,15 @@ static void rtp_topic_handler(void *data, struct stasis_subscription *sub, struc
 
 static int load_module(void)
 {
-	if (!ast_module_check("res_hep.so") || !hepv3_is_loaded()) {
-		ast_log(AST_LOG_WARNING, "res_hep is not loaded or running; declining module load\n");
+	if (!hepv3_is_loaded()) {
+		ast_log(AST_LOG_WARNING, "res_hep is disabled; declining module load\n");
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	stasis_rtp_subscription = stasis_subscribe(ast_rtp_topic(),
 		rtp_topic_handler, NULL);
 	if (!stasis_rtp_subscription) {
-		return AST_MODULE_LOAD_FAILURE;
+		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	return AST_MODULE_LOAD_SUCCESS;
@@ -172,8 +180,9 @@ static int unload_module(void)
 	return 0;
 }
 
-AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "RTCP HEPv3 Logger",
+AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_DEFAULT, "RTCP HEPv3 Logger",
+	.support_level = AST_MODULE_SUPPORT_EXTENDED,
 	.load = load_module,
 	.unload = unload_module,
-	.load_pri = AST_MODPRI_DEFAULT,
+	.requires = "res_hep",
 );

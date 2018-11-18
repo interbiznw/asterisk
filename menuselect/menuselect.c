@@ -238,6 +238,10 @@ static enum support_level_values string_to_support_level(const char *support_lev
 		return SUPPORT_EXTERNAL;
 	}
 
+	if (!strcasecmp(support_level, "option")) {
+		return SUPPORT_OPTION;
+	}
+
 	return SUPPORT_UNSPECIFIED;
 }
 
@@ -253,6 +257,8 @@ static const char *support_level_to_string(enum support_level_values support_lev
 		return "Deprecated";
 	case SUPPORT_EXTERNAL:
 		return "External";
+	case SUPPORT_OPTION:
+		return "Module Options";
 	default:
 		return "Unspecified";
 	}
@@ -461,7 +467,7 @@ static int process_xml_member_node(xmlNode *node, struct category *cat)
 		process_process_xml_category_child_node(cur, mem);
 	}
 
-	if (!cat->positive_output) {
+	if (!cat->positive_output && strcasecmp(mem->support_level, "option")) {
 		mem->enabled = 1;
 		if (!mem->defaultenabled || strcasecmp(mem->defaultenabled, "no")) {
 			mem->was_enabled = 1;
@@ -980,8 +986,12 @@ static int match_member_relations(void)
 		}
 	}
 
-	/* If weak linking is not supported, move module uses which are other modules to the dependency list */
-#if !defined(HAVE_ATTRIBUTE_weak_import) && !defined(HAVE_ATTRIBUTE_weakref) && !defined(HAVE_ATTRIBUTE_weak)
+/*
+ * BUGBUG:
+ * This doesn't work, the only way we can fix this is to remove OPTIONAL_API
+ * toggle from menuselect and add a command-line argument to ./configure.
+ */
+#if 0
 	AST_LIST_TRAVERSE(&categories, cat, list) {
 		AST_LIST_TRAVERSE(&cat->members, mem, list) {
 			if (mem->is_separator) {

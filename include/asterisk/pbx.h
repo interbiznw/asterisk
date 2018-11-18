@@ -85,7 +85,7 @@ struct ast_exten;
 struct ast_include;
 struct ast_ignorepat;
 struct ast_sw;
- 
+
 enum ast_state_cb_update_reason {
 	/*! The extension state update is a result of a device state changing on the extension. */
 	AST_HINT_UPDATE_DEVICE = 1,
@@ -505,11 +505,15 @@ int ast_add_extension(const char *context, int replace, const char *extension,
 /*!
  * \brief Add an extension to an extension context, this time with an ast_context *.
  *
- * \note For details about the arguments, check ast_add_extension()
+ * \param registrar_file optional configuration file that defines this extension
+ * \param registrar_line optional line number of configuration file that defines extension
+ *
+ * \note For details about the other arguments, check ast_add_extension()
  */
 int ast_add_extension2(struct ast_context *con, int replace, const char *extension,
 	int priority, const char *label, const char *callerid,
-	const char *application, void *data, void (*datad)(void *), const char *registrar);
+	const char *application, void *data, void (*datad)(void *), const char *registrar,
+	const char *registrar_file, int registrar_line);
 
 /*!
  * \brief Same as ast_add_extension2, but assumes you have already locked context
@@ -520,7 +524,8 @@ int ast_add_extension2(struct ast_context *con, int replace, const char *extensi
  */
 int ast_add_extension2_nolock(struct ast_context *con, int replace, const char *extension,
 	int priority, const char *label, const char *callerid,
-	const char *application, void *data, void (*datad)(void *), const char *registrar);
+	const char *application, void *data, void (*datad)(void *), const char *registrar,
+	const char *registrar_file, int registrar_line);
 
 /*!
  * \brief Map devstate to an extension state.
@@ -1103,7 +1108,7 @@ int ast_rdlock_context(struct ast_context *con);
 int ast_unlock_context(struct ast_context *con);
 
 /*!
- * \brief locks the macrolock in the given given context
+ * \brief locks the macrolock in the given context
  *
  * \param macrocontext name of the macro-context to lock
  *
@@ -1139,6 +1144,12 @@ int ast_async_goto(struct ast_channel *chan, const char *context, const char *ex
  */
 int ast_async_goto_by_name(const char *chan, const char *context, const char *exten, int priority);
 
+enum ast_pbx_outgoing_sync {
+	AST_OUTGOING_NO_WAIT = 0,       /*!< Don't wait for originated call to answer */
+	AST_OUTGOING_WAIT = 1,          /*!< Wait for originated call to answer */
+	AST_OUTGOING_WAIT_COMPLETE = 2, /*!< Wait for originated call to answer and hangup */
+};
+
 /*!
  * \brief Synchronously or asynchronously make an outbound call and send it to a
  * particular extension
@@ -1152,11 +1163,15 @@ int ast_async_goto_by_name(const char *chan, const char *context, const char *ex
  * \param priority The destination priority for the outbound channel
  * \param reason Optional.  If provided, the dialed status of the outgoing channel.
  *        Codes are AST_CONTROL_xxx values.  Valid only if synchronous is non-zero.
- * \param synchronous If zero then don't wait for anything.
- *        If one then block until the outbound channel answers or the call fails.
- *        If greater than one then wait for the call to complete or if the call doesn't
- *        answer and failed@context exists then run a channel named OutgoingSpoolFailed
- *        at failed@context.
+ * \param synchronous defined by the ast_pbx_outgoing_sync enum.
+ *        If \c AST_OUTGOING_NO_WAIT then don't wait for anything.
+ *        If \c AST_OUTGOING_WAIT then block until the outbound channel answers or
+ *        the call fails.
+ *        If \c AST_OUTGOING_WAIT_COMPLETE then wait for the call to complete or
+ *        fail.
+ *        If \c AST_OUTGOING_WAIT or \c AST_OUTGOING_WAIT_COMPLETE is specified,
+ *        the call doesn't answer, and \c failed@context exists then run a channel
+ *        named \c OutgoingSpoolFailed at \c failed@context.
  * \param cid_num The caller ID number to set on the outbound channel
  * \param cid_name The caller ID name to set on the outbound channel
  * \param vars Variables to set on the outbound channel
@@ -1176,6 +1191,12 @@ int ast_pbx_outgoing_exten(const char *type, struct ast_format_cap *cap, const c
 	const char *account, struct ast_channel **locked_channel, int early_media,
 	const struct ast_assigned_ids *assignedids);
 
+int ast_pbx_outgoing_exten_predial(const char *type, struct ast_format_cap *cap, const char *addr,
+	int timeout, const char *context, const char *exten, int priority, int *reason,
+	int synchronous, const char *cid_num, const char *cid_name, struct ast_variable *vars,
+	const char *account, struct ast_channel **locked_channel, int early_media,
+	const struct ast_assigned_ids *assignedids, const char *predial_callee);
+
 /*!
  * \brief Synchronously or asynchronously make an outbound call and execute an
  *  application on the channel.
@@ -1190,9 +1211,12 @@ int ast_pbx_outgoing_exten(const char *type, struct ast_format_cap *cap, const c
  * \param appdata Data to pass to the application
  * \param reason Optional.  If provided, the dialed status of the outgoing channel.
  *        Codes are AST_CONTROL_xxx values.  Valid only if synchronous is non-zero.
- * \param synchronous If zero then don't wait for anything.
- *        If one then block until the outbound channel answers or the call fails.
- *        If greater than one then wait for the call to complete.
+ * \param synchronous defined by the ast_pbx_outgoing_sync enum.
+ *        If \c AST_OUTGOING_NO_WAIT then don't wait for anything.
+ *        If \c AST_OUTGOING_WAIT then block until the outbound channel answers or
+ *        the call fails.
+ *        If \c AST_OUTGOING_WAIT_COMPLETE then wait for the call to complete or
+ *        fail.
  * \param cid_num The caller ID number to set on the outbound channel
  * \param cid_name The caller ID name to set on the outbound channel
  * \param vars Variables to set on the outbound channel
@@ -1210,6 +1234,12 @@ int ast_pbx_outgoing_app(const char *type, struct ast_format_cap *cap, const cha
 	const char *cid_num, const char *cid_name, struct ast_variable *vars,
 	const char *account, struct ast_channel **locked_channel,
 	const struct ast_assigned_ids *assignedids);
+
+int ast_pbx_outgoing_app_predial(const char *type, struct ast_format_cap *cap, const char *addr,
+	int timeout, const char *app, const char *appdata, int *reason, int synchronous,
+	const char *cid_num, const char *cid_name, struct ast_variable *vars,
+	const char *account, struct ast_channel **locked_channel,
+	const struct ast_assigned_ids *assignedids, const char *predial_callee);
 
 /*!
  * \brief Evaluate a condition
@@ -1253,6 +1283,23 @@ const char *ast_get_include_registrar(const struct ast_include *i);
 const char *ast_get_ignorepat_registrar(const struct ast_ignorepat *ip);
 const char *ast_get_switch_registrar(const struct ast_sw *sw);
 /*! @} */
+
+/*!
+ * \brief Get name of configuration file used by registrar to register this extension
+ *
+ * \retval NULL if registrar did not indicate config file when registering the extension
+ * \retval name of the file used to register the extension
+ */
+const char *ast_get_extension_registrar_file(struct ast_exten *e);
+
+/*!
+ * \brief Get line number of configuration file used by registrar to register this extension
+ *
+ * \retval 0 if the line wasn't indicated when the extension was registered
+ * \retval positive integer indicating what line in the config file was responsible for
+ *         registering the extension.
+ */
+int ast_get_extension_registrar_line(struct ast_exten *e);
 
 /*! @name Walking functions ... */
 /*! @{ */
@@ -1385,7 +1432,7 @@ void ast_str_substitute_variables_varshead(struct ast_str **buf, ssize_t maxlen,
  * \param c Channel variables from which to extract values, and channel to pass to any dialplan functions.
  * \param headp If no channel is specified, a channel list from which to extract variable values
  * \param templ Variable template to expand.
- * \param used Number of bytes read from the template.
+ * \param used Number of bytes read from the template.  (May be NULL)
  */
 void ast_str_substitute_variables_full(struct ast_str **buf, ssize_t maxlen, struct ast_channel *c, struct varshead *headp, const char *templ, size_t *used);
 /*! @} */

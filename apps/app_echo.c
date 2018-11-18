@@ -31,8 +31,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/file.h"
 #include "asterisk/module.h"
 #include "asterisk/channel.h"
@@ -44,7 +42,7 @@ ASTERISK_REGISTER_FILE()
 		</synopsis>
 		<syntax />
 		<description>
-			<para>Echos back any media or DTMF frames read from the calling 
+			<para>Echos back any media or DTMF frames read from the calling
 			channel back to itself. This will not echo CONTROL, MODEM, or NULL
 			frames. Note: If '#' detected application exits.</para>
 			<para>This application does not automatically answer and should be
@@ -68,7 +66,8 @@ static int echo_exec(struct ast_channel *chan, const char *data)
 		f->delivery.tv_sec = 0;
 		f->delivery.tv_usec = 0;
 		if (f->frametype == AST_FRAME_CONTROL
-			&& f->subclass.integer == AST_CONTROL_VIDUPDATE) {
+			&& f->subclass.integer == AST_CONTROL_VIDUPDATE
+			&& !fir_sent) {
 			if (ast_write(chan, f) < 0) {
 				ast_frfree(f);
 				goto end;

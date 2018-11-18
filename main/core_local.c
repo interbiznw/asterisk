@@ -33,8 +33,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 /* ------------------------------------------------------------------- */
 
 #include "asterisk/channel.h"
@@ -235,43 +233,39 @@ struct local_pvt {
 	char exten[AST_MAX_EXTENSION];
 };
 
-void ast_local_lock_all(struct ast_channel *chan, struct ast_channel **outchan,
-			struct ast_channel **outowner)
+void ast_local_lock_all(struct ast_channel *chan, void **tech_pvt,
+	struct ast_channel **base_chan, struct ast_channel **base_owner)
 {
 	struct local_pvt *p = ast_channel_tech_pvt(chan);
 
-	*outchan = NULL;
-	*outowner = NULL;
+	*tech_pvt = NULL;
+	*base_chan = NULL;
+	*base_owner = NULL;
 
 	if (p) {
-		ao2_ref(p, 1);
-		ast_unreal_lock_all(&p->base, outchan, outowner);
+		*tech_pvt = ao2_bump(p);
+		ast_unreal_lock_all(&p->base, base_chan, base_owner);
 	}
 }
 
-void ast_local_unlock_all(struct ast_channel *chan)
+void ast_local_unlock_all(void *tech_pvt, struct ast_channel *base_chan,
+	struct ast_channel *base_owner)
 {
-	struct local_pvt *p = ast_channel_tech_pvt(chan);
-	struct ast_unreal_pvt *base;
-
-	if (!p) {
-		return;
+	if (base_chan) {
+		ast_channel_unlock(base_chan);
+		ast_channel_unref(base_chan);
 	}
 
-	base = &p->base;
-
-	if (base->owner) {
-		ast_channel_unlock(base->owner);
-		ast_channel_unref(base->owner);
+	if (base_owner) {
+		ast_channel_unlock(base_owner);
+		ast_channel_unref(base_owner);
 	}
 
-	if (base->chan) {
-		ast_channel_unlock(base->chan);
-		ast_channel_unref(base->chan);
+	if (tech_pvt) {
+		struct local_pvt *p = tech_pvt;
+		ao2_unlock(&p->base);
+		ao2_ref(tech_pvt, -1);
 	}
-
-	ao2_unlock(base);
-	ao2_ref(p, -1);
 }
 
 struct ast_channel *ast_local_get_peer(struct ast_channel *ast)
@@ -1055,7 +1049,6 @@ static void local_shutdown(void)
 
 int ast_local_init(void)
 {
-
 	if (STASIS_MESSAGE_TYPE_INIT(ast_local_optimization_begin_type)) {
 		return -1;
 	}
@@ -1075,17 +1068,13 @@ int ast_local_init(void)
 
 	locals = ao2_container_alloc_list(AO2_ALLOC_OPT_LOCK_MUTEX, 0, NULL, locals_cmp_cb);
 	if (!locals) {
-		ao2_cleanup(local_tech.capabilities);
-		local_tech.capabilities = NULL;
 		return -1;
 	}
 
 	/* Make sure we can register our channel type */
 	if (ast_channel_register(&local_tech)) {
 		ast_log(LOG_ERROR, "Unable to register channel class 'Local'\n");
-		ao2_ref(locals, -1);
-		ao2_cleanup(local_tech.capabilities);
-		local_tech.capabilities = NULL;
+
 		return -1;
 	}
 	ast_cli_register_multiple(cli_local, ARRAY_LEN(cli_local));

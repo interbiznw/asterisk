@@ -18,6 +18,7 @@
 
 /*** MODULEINFO
 	<depend>pjproject</depend>
+	<depend>res_pjproject</depend>
 	<depend>res_pjsip</depend>
 	<support_level>core</support_level>
  ***/
@@ -34,6 +35,7 @@
 #include "asterisk/taskprocessor.h"
 #include "asterisk/threadpool.h"
 #include "asterisk/datastore.h"
+#include "res_pjsip/include/res_pjsip_private.h"
 
 /*** DOCUMENTATION
 	<configInfo name="res_pjsip_outbound_publish" language="en_US">
@@ -55,10 +57,21 @@
 					<synopsis>Expiration time for publications in seconds</synopsis>
 				</configOption>
 				<configOption name="outbound_auth" default="">
-					<synopsis>Authentication object to be used for outbound publishes.</synopsis>
+					<synopsis>Authentication object(s) to be used for outbound publishes.</synopsis>
+					<description><para>
+						This is a comma-delimited list of <replaceable>auth</replaceable>
+						sections defined in <filename>pjsip.conf</filename> used to respond
+						to outbound authentication challenges.</para>
+						<note><para>
+						Using the same auth section for inbound and outbound
+						authentication is not recommended.  There is a difference in
+						meaning for an empty realm setting between inbound and outbound
+						authentication uses.  See the auth realm description for details.
+						</para></note>
+					</description>
 				</configOption>
 				<configOption name="outbound_proxy" default="">
-					<synopsis>SIP URI of the outbound proxy used to send publishes</synopsis>
+					<synopsis>Full SIP URI of the outbound proxy used to send publishes</synopsis>
 				</configOption>
 				<configOption name="server_uri">
 					<synopsis>SIP URI of the server and entity to publish to</synopsis>
@@ -332,7 +345,6 @@ AST_RWLIST_HEAD_STATIC(publisher_handlers, ast_sip_event_publisher_handler);
 static void sub_add_handler(struct ast_sip_event_publisher_handler *handler)
 {
 	AST_RWLIST_INSERT_TAIL(&publisher_handlers, handler, next);
-	ast_module_ref(ast_module_info->self);
 }
 
 static struct ast_sip_event_publisher_handler *find_publisher_handler_for_event_name(const char *event_name)
@@ -350,7 +362,8 @@ static struct ast_sip_event_publisher_handler *find_publisher_handler_for_event_
 /*! \brief Helper function which cancels the refresh timer on a publisher */
 static void cancel_publish_refresh(struct sip_outbound_publisher *publisher)
 {
-	if (pj_timer_heap_cancel(pjsip_endpt_get_timer_heap(ast_sip_get_pjsip_endpoint()), &publisher->timer)) {
+	if (pj_timer_heap_cancel_if_active(pjsip_endpt_get_timer_heap(ast_sip_get_pjsip_endpoint()),
+		&publisher->timer, 0)) {
 		/* The timer was successfully cancelled, drop the refcount of the publisher */
 		ao2_ref(publisher, -1);
 	}
@@ -415,9 +428,11 @@ static void set_transport(struct sip_outbound_publisher *publisher, pjsip_tx_dat
 {
 	if (!ast_strlen_zero(publisher->owner->publish->transport)) {
 		pjsip_tpselector selector = { .type = PJSIP_TPSELECTOR_NONE, };
+
 		ast_sip_set_tpselector_from_transport_name(
 			publisher->owner->publish->transport, &selector);
 		pjsip_tx_data_set_transport(tdata, &selector);
+		ast_sip_tpselector_unref(&selector);
 	}
 }
 
@@ -630,7 +645,6 @@ void ast_sip_unregister_event_publisher_handler(struct ast_sip_event_publisher_h
 	AST_RWLIST_TRAVERSE_SAFE_BEGIN(&publisher_handlers, iter, next) {
 		if (handler == iter) {
 			AST_RWLIST_REMOVE_CURRENT(next);
-			ast_module_unref(ast_module_info->self);
 			break;
 		}
 	}
@@ -786,6 +800,7 @@ static int publisher_client_send(void *obj, void *arg, void *data, int flags)
 	struct sip_outbound_publish_message *message;
 	size_t type_len = 0, subtype_len = 0, body_text_len = 0;
 	int *res = data;
+	SCOPED_AO2LOCK(lock, publisher);
 
 	*res = -1;
 	if (!publisher->client) {
@@ -973,7 +988,7 @@ static int sip_outbound_publisher_init(void *data)
 
 	pj_cstr(&event, publish->event);
 	if (pjsip_publishc_init(publisher->client, &event, &server_uri, &from_uri, &to_uri,
-				publish->expiration != PJ_SUCCESS)) {
+			publish->expiration) != PJ_SUCCESS) {
 		ast_log(LOG_ERROR, "Failed to initialize publishing client on outbound publish '%s'\n",
 			ast_sorcery_object_get_id(publish));
 		pjsip_endpt_release_pool(ast_sip_get_pjsip_endpoint(), pool);
@@ -1057,7 +1072,7 @@ static struct sip_outbound_publisher *sip_outbound_publisher_alloc(
 		return NULL;
 	}
 
-	if (ast_sip_push_task_synchronous(NULL, sip_outbound_publisher_init, publisher)) {
+	if (ast_sip_push_task_wait_servant(NULL, sip_outbound_publisher_init, publisher)) {
 		ast_log(LOG_ERROR, "Unable to create publisher for outbound publish '%s'\n",
 			ast_sorcery_object_get_id(client->publish));
 		ao2_ref(publisher, -1);
@@ -1447,8 +1462,25 @@ static int validate_publish_config(struct ast_sip_outbound_publish *publish)
 		ast_log(LOG_ERROR, "No server URI specified on outbound publish '%s'\n",
 			ast_sorcery_object_get_id(publish));
 		return -1;
+	} else if (ast_sip_validate_uri_length(publish->server_uri)) {
+		ast_log(LOG_ERROR, "Server URI or hostname length exceeds pjproject limit or is not a sip(s) uri: '%s' on outbound publish '%s'\n",
+			publish->server_uri,
+			ast_sorcery_object_get_id(publish));
+		return -1;
 	} else if (ast_strlen_zero(publish->event)) {
 		ast_log(LOG_ERROR, "No event type specified for outbound publish '%s'\n",
+			ast_sorcery_object_get_id(publish));
+		return -1;
+	} else if (!ast_strlen_zero(publish->from_uri)
+		&& ast_sip_validate_uri_length(publish->from_uri)) {
+		ast_log(LOG_ERROR, "From URI or hostname length exceeds pjproject limit or is not a sip(s) uri: '%s' on outbound publish '%s'\n",
+			publish->from_uri,
+			ast_sorcery_object_get_id(publish));
+		return -1;
+	} else if (!ast_strlen_zero(publish->to_uri)
+		&& ast_sip_validate_uri_length(publish->to_uri)) {
+		ast_log(LOG_ERROR, "To URI or hostname length exceeds pjproject limit or is not a sip(s) uri: '%s' on outbound publish '%s'\n",
+			publish->to_uri,
 			ast_sorcery_object_get_id(publish));
 		return -1;
 	}
@@ -1484,8 +1516,8 @@ static int current_state_reusable(struct ast_sip_outbound_publish *publish,
 	 */
 	old_publish = current_state->client->publish;
 	current_state->client->publish = publish;
-	if (ast_sip_push_task_synchronous(
-		    NULL, sip_outbound_publisher_reinit_all, current_state->client->publishers)) {
+	if (ast_sip_push_task_wait_servant(NULL, sip_outbound_publisher_reinit_all,
+		current_state->client->publishers)) {
 		/*
 		 * If the state object fails to re-initialize then swap
 		 * the old publish info back in.
@@ -1525,9 +1557,9 @@ static int sip_outbound_publish_apply(const struct ast_sorcery *sorcery, void *o
 	 * object if created/updated, or keep the old object if an error occurs.
 	 */
 	if (!new_states) {
-		new_states = ao2_container_alloc_options(
-			AO2_ALLOC_OPT_LOCK_NOLOCK, DEFAULT_STATE_BUCKETS,
-			outbound_publish_state_hash, outbound_publish_state_cmp);
+		new_states = ao2_container_alloc_hash(
+			AO2_ALLOC_OPT_LOCK_NOLOCK, 0, DEFAULT_STATE_BUCKETS,
+			outbound_publish_state_hash, NULL, outbound_publish_state_cmp);
 
 		if (!new_states) {
 			ast_log(LOG_ERROR, "Unable to allocate new states container\n");
@@ -1612,14 +1644,12 @@ static int unload_module(void)
 
 static int load_module(void)
 {
-	CHECK_PJSIP_MODULE_LOADED();
-
 	/* As of pjproject 2.4.5, PJSIP_MAX_URL_SIZE isn't exposed yet but we try anyway. */
 	ast_pjproject_get_buildopt("PJSIP_MAX_URL_SIZE", "%d", &pjsip_max_url_size);
 
 	shutdown_group = ast_serializer_shutdown_group_alloc();
 	if (!shutdown_group) {
-		return AST_MODULE_LOAD_FAILURE;
+		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	ast_sorcery_apply_config(ast_sip_get_sorcery(), "res_pjsip_outbound_publish");
@@ -1666,8 +1696,10 @@ static int reload_module(void)
 }
 
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_ORDER, "PJSIP Outbound Publish Support",
+	.support_level = AST_MODULE_SUPPORT_CORE,
 	.load = load_module,
 	.reload = reload_module,
 	.unload = unload_module,
 	.load_pri = AST_MODPRI_CHANNEL_DEPEND,
+	.requires = "res_pjproject,res_pjsip",
 );

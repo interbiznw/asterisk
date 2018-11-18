@@ -65,8 +65,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/io.h"
 #include "asterisk/file.h"
 #include "asterisk/logger.h"
@@ -365,7 +363,7 @@ ASTERISK_REGISTER_FILE()
 					'gateway' and state is 'Uninitialized'.</para>
 				</parameter>
 				<parameter name="FileName" required="false">
-					<para>Filename of the image being sent/recieved for this FAX session. This field is not
+					<para>Filename of the image being sent/received for this FAX session. This field is not
 					included if Operation isn't 'send' or 'receive'.</para>
 				</parameter>
 				<parameter name="PagesTransmitted" required="false">
@@ -377,7 +375,7 @@ ASTERISK_REGISTER_FILE()
 					Operation is not 'send' or 'receive'. Will be 0 for 'send'.</para>
 				</parameter>
 				<parameter name="TotalBadLines" required="false">
-					<para>Total number of bad lines sent/recieved during this session. This field is not
+					<para>Total number of bad lines sent/received during this session. This field is not
 					included if Operation is not 'send' or 'received'.</para>
 				</parameter>
 			</syntax>
@@ -980,7 +978,6 @@ int ast_fax_tech_register(struct ast_fax_tech *tech)
 	AST_RWLIST_WRLOCK(&faxmodules);
 	AST_RWLIST_INSERT_TAIL(&faxmodules, fax, list);
 	AST_RWLIST_UNLOCK(&faxmodules);
-	ast_module_ref(ast_module_info->self);
 
 	ast_verb(3, "Registered handler for '%s' (%s)\n", fax->tech->type, fax->tech->description);
 
@@ -1000,7 +997,6 @@ void ast_fax_tech_unregister(struct ast_fax_tech *tech)
 			continue;
 		}
 		AST_RWLIST_REMOVE_CURRENT(list);
-		ast_module_unref(ast_module_info->self);
 		ast_free(fax);
 		ast_verb(4, "Unregistered FAX module type '%s'\n", tech->type);
 		break;
@@ -1163,8 +1159,10 @@ static struct ast_fax_session *fax_session_reserve(struct ast_fax_session_detail
 		if ((faxmod->tech->caps & details->caps) != details->caps) {
 			continue;
 		}
+		if (!ast_module_running_ref(faxmod->tech->module)) {
+			continue;
+		}
 		ast_debug(4, "Reserving a FAX session from '%s'.\n", faxmod->tech->description);
-		ast_module_ref(faxmod->tech->module);
 		s->tech = faxmod->tech;
 		break;
 	}
@@ -1281,8 +1279,10 @@ static struct ast_fax_session *fax_session_new(struct ast_fax_session_details *d
 			if ((faxmod->tech->caps & details->caps) != details->caps) {
 				continue;
 			}
+			if (!ast_module_running_ref(faxmod->tech->module)) {
+				continue;
+			}
 			ast_debug(4, "Requesting a new FAX session from '%s'.\n", faxmod->tech->description);
-			ast_module_ref(faxmod->tech->module);
 			if (reserved) {
 				/* Balance module ref from reserved session */
 				ast_module_unref(reserved->tech->module);
@@ -1415,11 +1415,13 @@ static int report_fax_status(struct ast_channel *chan, struct ast_fax_session_de
 	}
 
 	json_object = ast_json_pack("{s: s, s: s, s: s, s: s, s: o}",
-			"type", "status",
-			"operation", (details->caps & AST_FAX_TECH_GATEWAY) ? "gateway" : (details->caps & AST_FAX_TECH_RECEIVE) ? "receive" : "send",
-			"status", status,
-			"local_station_id", details->localstationid,
-			"filenames", json_filenames);
+		"type", "status",
+		"operation", (details->caps & AST_FAX_TECH_GATEWAY)
+			? "gateway"
+			: (details->caps & AST_FAX_TECH_RECEIVE) ? "receive" : "send",
+		"status", status,
+		"local_station_id", AST_JSON_UTF8_VALIDATE(details->localstationid),
+		"filenames", json_filenames);
 	if (!json_object) {
 		return -1;
 	}
@@ -1599,6 +1601,13 @@ static int generic_fax_exec(struct ast_channel *chan, struct ast_fax_session_det
 	struct timeval start;
 
 	chancount = 1;
+
+	/* Make sure one or the other is set to avoid race condition */
+	if (t38negotiated) {
+		details->caps |= AST_FAX_TECH_T38;
+	} else {
+		details->caps |= AST_FAX_TECH_AUDIO;
+	}
 
 	/* create the FAX session */
 	if (!(fax = fax_session_new(details, chan, reserved, token))) {
@@ -2904,6 +2913,11 @@ static int fax_gateway_start(struct fax_gateway *gateway, struct ast_fax_session
 {
 	struct ast_fax_session *s;
 	int start_res;
+
+	/* if the fax gateway is already started then do nothing */
+	if (gateway->s && gateway->s->state != AST_FAX_STATE_RESERVED) {
+		return 0;
+	}
 
 	/* create the FAX session */
 	if (!(s = fax_session_new(details, chan, gateway->s, gateway->token))) {
@@ -4554,12 +4568,7 @@ static int acf_faxopt_write(struct ast_channel *chan, const char *cmd, char *dat
 					unsigned int gwtimeout;
 
 					if (sscanf(timeout, "%30u", &gwtimeout) == 1) {
-						if (gwtimeout >= 0) {
-							details->gateway_timeout = gwtimeout * 1000;
-						} else {
-							ast_log(LOG_WARNING, "%s(%s) timeout cannot be negative.  Ignoring timeout\n",
-								cmd, data);
-						}
+						details->gateway_timeout = gwtimeout * 1000;
 					} else {
 						ast_log(LOG_WARNING, "Unsupported timeout '%s' passed to FAXOPT(%s).\n", timeout, data);
 					}
@@ -4598,13 +4607,7 @@ static int acf_faxopt_write(struct ast_channel *chan, const char *cmd, char *dat
 			if (details->faxdetect_id < 0) {
 				if (timeout) {
 					if (sscanf(timeout, "%30u", &fdtimeout) == 1) {
-						if (fdtimeout >= 0) {
-							fdtimeout *= 1000;
-						} else {
-							ast_log(LOG_WARNING, "%s(%s) timeout cannot be negative.  Ignoring timeout\n",
-								cmd, data);
-							fdtimeout = 0;
-						}
+						fdtimeout *= 1000;
 					} else {
 						ast_log(LOG_WARNING, "Unsupported timeout '%s' passed to FAXOPT(%s).\n",
 							timeout, data);

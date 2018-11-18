@@ -33,8 +33,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include <pjsip.h>
 #include "asterisk/test.h"
 #include "asterisk/module.h"
@@ -378,8 +376,6 @@ AST_TEST_DEFINE(scheduler_policy)
 
 static int load_module(void)
 {
-	CHECK_PJSIP_MODULE_LOADED();
-
 	AST_TEST_REGISTER(serialized_scheduler);
 	AST_TEST_REGISTER(unserialized_scheduler);
 	AST_TEST_REGISTER(scheduler_cleanup);
@@ -398,4 +394,9 @@ static int unload_module(void)
 	return 0;
 }
 
-AST_MODULE_INFO_STANDARD(ASTERISK_GPL_KEY, "res_pjsip scheduler test module");
+AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_DEFAULT, "res_pjsip scheduler test module",
+	.support_level = AST_MODULE_SUPPORT_CORE,
+	.load = load_module,
+	.unload = unload_module,
+	.requires = "res_pjsip",
+);

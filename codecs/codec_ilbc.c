@@ -32,8 +32,6 @@
 
 #include "asterisk.h"
 
-ASTERISK_REGISTER_FILE()
-
 #include "asterisk/codec.h"             /* for AST_MEDIA_TYPE_AUDIO */
 #include "asterisk/format.h"            /* for ast_format_get_attribute_data */
 #include "asterisk/frame.h"             /* for ast_frame, etc */
@@ -44,8 +42,8 @@ ASTERISK_REGISTER_FILE()
 
 #ifdef ILBC_WEBRTC
 #include <ilbc.h>
-typedef WebRtc_UWord16 ilbc_bytes;
-typedef WebRtc_Word16  ilbc_block;
+typedef uint16_t ilbc_bytes;
+typedef int16_t  ilbc_block;
 #define BUF_TYPE i16
 #else
 #include "ilbc/iLBC_encode.h"
@@ -269,7 +267,7 @@ static int load_module(void)
 
 	if (res) {
 		unload_module();
-		return AST_MODULE_LOAD_FAILURE;
+		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	return AST_MODULE_LOAD_SUCCESS;
